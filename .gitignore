@@ -1,0 +1,192 @@
+# ============================================================================
+# PYTHON & VIRTUAL ENVIRONMENT
+# ============================================================================
+venv/
+env/
+ENV/
+.venv
+*.pyc
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ============================================================================
+# IDE & EDITOR CONFIGURATION
+# ============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+.vim/
+.emacs.d/
+
+# ============================================================================
+# ENVIRONMENT & SECRETS
+# ============================================================================
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+.env.test
+secrets.json
+credentials.json
+google_api_key.txt
+*.key
+*.pem
+
+# ============================================================================
+# DATABASE
+# ============================================================================
+db.sqlite3
+db.sqlite3-journal
+*.db
+*.sqlite
+*.sqlite3
+*.pgdump
+postgres_data/
+pgdata/
+
+# ============================================================================
+# LOGS
+# ============================================================================
+logs/
+*.log
+*.log.*
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# ============================================================================
+# STATIC & MEDIA FILES (if dynamically generated)
+# ============================================================================
+staticfiles/
+static/
+media/
+uploads/
+
+# ============================================================================
+# CACHE & TEMPORARY FILES
+# ============================================================================
+.cache/
+*.cache
+*.tmp
+temp/
+tmp/
+*.bak
+*.backup
+~$*
+
+# ============================================================================
+# OS-SPECIFIC
+# ============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.AppleDouble
+.LSOverride
+
+# ============================================================================
+# TESTING & COVERAGE
+# ============================================================================
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.tox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ============================================================================
+# NODE.JS (if using frontend build tools)
+# ============================================================================
+node_modules/
+npm-debug.log
+yarn-error.log
+package-lock.json
+yarn.lock
+
+# ============================================================================
+# DOCKER & CONTAINERS
+# ============================================================================
+.dockerignore
+docker-compose.override.yml
+.docker/
+
+# ============================================================================
+# PROJECT-SPECIFIC FILES
+# ============================================================================
+*.postman_collection.json.bak
+test_*.py.bak
+*.txt.bak
+DEPLOYMENT_STATUS.txt.bak
+PREPROCESSING_EXECUTION_LOG.txt.bak
+
+# ============================================================================
+# LARGE DATA FILES (not necessary to commit)
+# ============================================================================
+*.csv
+*.xlsx
+*.json.backup
+fuel_prices_*.csv
+
+# ============================================================================
+# CERTIFICATE FILES
+# ============================================================================
+*.cer
+*.crt
+*.pem
+*.pfx
+COMPLETION_CERTIFICATE.txt
+
+# ============================================================================
+# MISC
+# ============================================================================
+.ipynb_checkpoints/
+*.ipynb
+*.whl
+dist/
+build/
+.webassets-cache
+instance/
+.scrapy
+docs/_build/
+target/
+.ipynb_checkpoints
+.pytype/
+.mypy_cache/
+.dmypy.json
+dmypy.json

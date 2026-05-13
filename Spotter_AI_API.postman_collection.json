@@ -1,0 +1,348 @@
+{
+  "info": {
+    "name": "Spotter AI - Fuel Routing API",
+    "description": "Complete API collection for Spotter AI Fuel Routing Optimization",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "API Root",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", ""]
+        },
+        "description": "Get API information and available endpoints"
+      },
+      "response": []
+    },
+    {
+      "name": "Route Optimization",
+      "item": [
+        {
+          "name": "Optimize Route - LA to NY (Long Distance)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"start_address\": \"1500 Harbor Blvd, Los Angeles, CA 90210\",\n  \"end_address\": \"Empire State Building, 350 5th Ave, New York, NY 10118\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/optimize/",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "optimize", ""]
+            },
+            "description": "Calculate optimal fuel stops for a 2,789 mile route (LA to NY)"
+          },
+          "response": []
+        },
+        {
+          "name": "Optimize Route - Dallas to Houston (Short Distance)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"start_address\": \"1700 Commerce Street, Dallas, TX 75201\",\n  \"end_address\": \"1100 Louisiana Street, Houston, TX 77002\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/optimize/",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "optimize", ""]
+            },
+            "description": "Calculate fuel stops for a 240 mile route (Dallas to Houston) - single tank journey"
+          },
+          "response": []
+        },
+        {
+          "name": "Optimize Route - San Francisco to Las Vegas",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"start_address\": \"San Francisco, CA\",\n  \"end_address\": \"Las Vegas, NV\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/optimize/",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "optimize", ""]
+            },
+            "description": "Calculate fuel stops for 570 mile route - multiple stops expected"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Truck Stops",
+      "item": [
+        {
+          "name": "List All Truck Stops",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/truck-stops/",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "truck-stops", ""]
+            },
+            "description": "Get list of all available truck stops"
+          },
+          "response": []
+        },
+        {
+          "name": "List Truck Stops in Texas",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/truck-stops/?state=TX&page_size=50",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "truck-stops", ""],
+              "query": [
+                {
+                  "key": "state",
+                  "value": "TX"
+                },
+                {
+                  "key": "page_size",
+                  "value": "50"
+                }
+              ]
+            },
+            "description": "Get all truck stops in Texas"
+          },
+          "response": []
+        },
+        {
+          "name": "Find Cheapest Fuel Stops",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/truck-stops/cheapest/?limit=5",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "truck-stops", "cheapest", ""],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "5"
+                }
+              ]
+            },
+            "description": "Find the 5 cheapest truck stops nationwide"
+          },
+          "response": []
+        },
+        {
+          "name": "Find Cheapest Fuel in Texas",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/truck-stops/cheapest/?state=TX&limit=3",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "truck-stops", "cheapest", ""],
+              "query": [
+                {
+                  "key": "state",
+                  "value": "TX"
+                },
+                {
+                  "key": "limit",
+                  "value": "3"
+                }
+              ]
+            },
+            "description": "Find the 3 cheapest truck stops in Texas"
+          },
+          "response": []
+        },
+        {
+          "name": "Find Nearby Fuel Stops (Dallas)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/truck-stops/nearby/?lat=32.7767&lon=-96.7970&radius=100&limit=10",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "truck-stops", "nearby", ""],
+              "query": [
+                {
+                  "key": "lat",
+                  "value": "32.7767"
+                },
+                {
+                  "key": "lon",
+                  "value": "-96.7970"
+                },
+                {
+                  "key": "radius",
+                  "value": "100"
+                },
+                {
+                  "key": "limit",
+                  "value": "10"
+                }
+              ]
+            },
+            "description": "Find truck stops within 100 miles of Dallas"
+          },
+          "response": []
+        },
+        {
+          "name": "Find Nearby Fuel Stops (Los Angeles)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/truck-stops/nearby/?lat=34.0522&lon=-118.2437&radius=150&limit=10",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "truck-stops", "nearby", ""],
+              "query": [
+                {
+                  "key": "lat",
+                  "value": "34.0522"
+                },
+                {
+                  "key": "lon",
+                  "value": "-118.2437"
+                },
+                {
+                  "key": "radius",
+                  "value": "150"
+                },
+                {
+                  "key": "limit",
+                  "value": "10"
+                }
+              ]
+            },
+            "description": "Find truck stops within 150 miles of Los Angeles"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Route History",
+      "item": [
+        {
+          "name": "List Cached Routes",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/routes/",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "routes", ""]
+            },
+            "description": "Get previously calculated and cached routes"
+          },
+          "response": []
+        },
+        {
+          "name": "List Cached Routes (Sorted by Cost)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/routes/?ordering=-total_cost&page_size=10",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "routes", ""],
+              "query": [
+                {
+                  "key": "ordering",
+                  "value": "-total_cost"
+                },
+                {
+                  "key": "page_size",
+                  "value": "10"
+                }
+              ]
+            },
+            "description": "Get cached routes sorted by highest cost first"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "API Documentation",
+      "item": [
+        {
+          "name": "Swagger UI",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/docs/",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "docs", ""]
+            },
+            "description": "Interactive API documentation"
+          },
+          "response": []
+        },
+        {
+          "name": "ReDoc",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/redoc/",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "redoc", ""]
+            },
+            "description": "ReDoc API documentation"
+          },
+          "response": []
+        },
+        {
+          "name": "OpenAPI Schema",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/schema/",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "schema", ""]
+            },
+            "description": "Raw OpenAPI 3.0 schema"
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8000",
+      "type": "string"
+    }
+  ]
+}
