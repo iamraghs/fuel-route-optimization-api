@@ -4,8 +4,20 @@ Ensures fuel stops maintain forward geographic progression without backtracking,
 state regression, or corridor deviation. Critical for long-distance routes.
 """
 import logging
+import math
 from typing import List, Dict, Tuple, Optional
 from geopy.distance import geodesic
+
+
+def _fast_distance_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Fast haversine distance in miles (~0.5μs, <0.5% error vs geodesic)."""
+    R = 3958.8
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2.0) ** 2 + \
+        math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2.0) ** 2
+    c = 2.0 * math.asin(math.sqrt(a))
+    return R * c
 
 logger = logging.getLogger(__name__)
 
@@ -86,12 +98,12 @@ class RouteGeometryValidator:
                 # Find closest point on polyline to this stop
                 min_dist = float('inf')
                 for lat, lon in route_polyline_coords:
-                    dist = geodesic((station_lat, station_lon), (lat, lon)).miles
+                    dist = _fast_distance_miles(station_lat, station_lon, lat, lon)
                     min_dist = min(min_dist, dist)
-                
+
                 # REALISTIC CORRIDOR BOUNDS: Allow natural deviations for fuel station availability
                 # Short routes (<500mi): 15 miles max deviation
-                # Medium routes (500-1500mi): 30 miles max deviation  
+                # Medium routes (500-1500mi): 30 miles max deviation
                 # Long routes (>1500mi): 60 miles max deviation (realistic for cross-country routes)
                 if len(fuel_stops) <= 2:
                     max_deviation = 15.0  # Short routes
@@ -152,7 +164,7 @@ class RouteGeometryValidator:
             )
             
             # Check stops are getting closer to destination (no zigzag)
-            gap = geodesic(dist_a, dist_b).miles
+            gap = _fast_distance_miles(dist_a[0], dist_a[1], dist_b[0], dist_b[1])
             expected_gap = fuel_stops[i+1]['distance_from_start_miles'] - \
                           fuel_stops[i]['distance_from_start_miles']
             
@@ -218,7 +230,7 @@ class RouteGeometryValidator:
                     # Calculate minimum distance to any point on route polyline
                     min_dist = float('inf')
                     for lat, lon in route_polyline_coords:
-                        dist = geodesic((station_lat, station_lon), (lat, lon)).miles
+                        dist = _fast_distance_miles(station_lat, station_lon, lat, lon)
                         min_dist = min(min_dist, dist)
                     
                     deviation_distances.append(min_dist)

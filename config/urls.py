@@ -8,6 +8,6 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     
     # Main API endpoint
-    path('route/fuel-optimization', optimize_fuel_route, name='optimize-fuel-route'),
+    path('route/fuel-optimization/', optimize_fuel_route, name='optimize-fuel-route'),
 ]
 

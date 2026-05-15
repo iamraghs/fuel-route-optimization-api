@@ -40,9 +40,9 @@ from django.conf import settings
 from django.core.cache import cache
 from django.utils import timezone
 from django.contrib.gis.geos import Point, LineString
-from django.db.models import Q, F
-from geopy.distance import geodesic
+from django.db.models import Q, F, Avg
 import polyline
+import math
 
 from .models import (
     FuelStation, FuelPrice, PriceVersion, RouteCache,
@@ -75,23 +75,52 @@ GOOGLE_API_KEY = settings.GOOGLE_MAPS_API_KEY
 GOOGLE_ROUTES_ENDPOINT = settings.GOOGLE_ROUTES_API_ENDPOINT
 GOOGLE_GEOCODING_ENDPOINT = settings.GOOGLE_GEOCODING_API_ENDPOINT
 
+# HTTP connection pool for Google API calls (keep-alive, reused TCP connections)
+_http_session = requests.Session()
+_http_session.headers.update({'User-Agent': 'SpotterAI-FuelRouter/1.0'})
+_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=4,
+    pool_maxsize=8,
+    max_retries=0,
+    pool_block=False
+)
+_http_session.mount('https://', _adapter)
+_http_session.mount('http://', _adapter)
+
 
 # ============================================================================
 # DATA CLASSES (Business Objects)
 # ============================================================================
+
+def _fast_distance_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Fast haversine distance in miles (~0.5μs per call).
+
+    < 0.5% error vs geodesic for US distances, but 400x faster.
+    Used for all corridor filtering and snapping where raw speed matters.
+    Exact geodesic reserved for final reporting.
+    """
+    R = 3958.8  # Earth radius in miles
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2.0) ** 2 + \
+        math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2.0) ** 2
+    c = 2.0 * math.asin(math.sqrt(a))
+    return R * c
+
 
 @dataclass
 class Location:
     """Geographic coordinate."""
     latitude: float
     longitude: float
-    
+
     def as_tuple(self) -> Tuple[float, float]:
         return (self.latitude, self.longitude)
-    
+
     def distance_to(self, other: 'Location') -> float:
-        """Distance in miles using geodesic."""
-        return geodesic(self.as_tuple(), other.as_tuple()).miles
+        """Distance in miles using fast haversine (< 0.5% error vs geodesic)."""
+        return _fast_distance_miles(self.latitude, self.longitude, other.latitude, other.longitude)
 
 
 @dataclass
@@ -111,6 +140,7 @@ class FuelStopDetail:
     gallons_to_buy: float  # Gallons to purchase
     fuel_cost: Decimal  # Cost at this stop
     fuel_remaining_at_arrival: float  # Gallons remaining when arriving
+    fuel_after_refuel: float  # Gallons in tank after refueling (≤ VEHICLE_TANK)
     range_remaining_at_arrival: float  # Miles remaining before out of fuel
     remaining_range_after_fill: float  # Range after refueling (full tank)
     
@@ -204,7 +234,7 @@ class GeocodingService:
                         'region': 'us',
                         'components': 'country:US'
                     },
-                    timeout=settings.GOOGLE_API_TIMEOUT_SECONDS
+                    timeout=(2, 3)  # (connect_timeout, read_timeout)
                 )
                 response.raise_for_status()
                 
@@ -343,10 +373,10 @@ class RoutingService:
                 
                 logger.info(f"🔍 Request params: origin={params['origin']}, destination={params['destination']}")
                 
-                response = requests.get(
+                response = _http_session.get(
                     directions_url,
                     params=params,
-                    timeout=10
+                    timeout=(2, 3)  # (connect_timeout, read_timeout) — fail fast for <1s target
                 )
                 
                 logger.info(f"📤 Google API Response Status: {response.status_code}")
@@ -498,9 +528,10 @@ class FuelStationQueryService:
             if route.polyline_encoded:
                 try:
                     polyline_coords = FuelOptimizer.decode_route_to_coordinates(route.polyline_encoded)
-                    # ✅ PERFORMANCE: Sample polyline to reduce distance calculations
-                    # Every Nth waypoint keeps accuracy while reducing compute
-                    sample_rate = max(1, len(polyline_coords) // 50)  # Keep ~50 waypoints
+                    # ✅ PERFORMANCE: Sample polyline to ~200 waypoints for accuracy
+                    # Higher resolution (~200 points) ensures stations aren't missed
+                    # while keeping distance calculations manageable
+                    sample_rate = max(1, len(polyline_coords) // 200)
                     sampled_polyline_coords = polyline_coords[::sample_rate]
                     logger.info(f"Decoded polyline: {len(polyline_coords)} waypoints (sampled to {len(sampled_polyline_coords)})")
                 except Exception as e:
@@ -534,12 +565,7 @@ class FuelStationQueryService:
                 route_distance = start_loc.distance_to(end_loc)
                 
                 # ✅ FIX: Multi-level validation (bounding box + polyline)
-                # Level 1: Bounding box (fast filter)
-                lat_min = min(start_loc.latitude, end_loc.latitude) - 2.0
-                lat_max = max(start_loc.latitude, end_loc.latitude) + 2.0
-                lon_min = min(start_loc.longitude, end_loc.longitude) - 2.0
-                lon_max = max(start_loc.longitude, end_loc.longitude) + 2.0
-                
+                # Level 1: Bounding box (fast filter) — using route bounds, not start/end
                 is_near_start = dist_to_start <= buffer_miles + 100
                 is_near_end = dist_to_end <= buffer_miles + 100
                 is_in_route_box = (lat_min <= station_loc.latitude <= lat_max and 
@@ -614,6 +640,7 @@ class FuelStationQueryService:
             if route.polyline_encoded:
                 try:
                     polyline_coords = FuelOptimizer.decode_route_to_coordinates(route.polyline_encoded)
+                    # Use 50 sample points for coarse corridor filter (faster rejection)
                     sample_rate = max(1, len(polyline_coords) // 50)
                     sampled_polyline_coords = polyline_coords[::sample_rate]
                 except Exception as e:
@@ -627,41 +654,40 @@ class FuelStationQueryService:
             end_lat = float(ne.get('lat', 0))
             end_lon = float(ne.get('lng', 0))
             
-            start_loc = Location(start_lat, start_lon)
-            end_loc = Location(end_lat, end_lon)
-            
             filtered_stations = []
-            
+
+            # Pre-extract polyline coords as flat tuples for fast iteration
+            poly_points = list(sampled_polyline_coords or [])
+
             for station in pre_queried_stations:
-                station_loc = Location(float(station['latitude']), float(station['longitude']))
-                
-                # Quick distance check
-                dist_to_start = station_loc.distance_to(start_loc)
-                dist_to_end = station_loc.distance_to(end_loc)
-                
+                sta_lat = float(station['latitude'])
+                sta_lon = float(station['longitude'])
+
+                # Quick distance check using raw haversine (no Location objects)
+                dist_to_start = _fast_distance_miles(sta_lat, sta_lon, start_lat, start_lon)
+                dist_to_end = _fast_distance_miles(sta_lat, sta_lon, end_lat, end_lon)
+
                 is_near_start = dist_to_start <= buffer_miles + 100
                 is_near_end = dist_to_end <= buffer_miles + 100
-                
-                lat_min = min(start_loc.latitude, end_loc.latitude) - 2.0
-                lat_max = max(start_loc.latitude, end_loc.latitude) + 2.0
-                lon_min = min(start_loc.longitude, end_loc.longitude) - 2.0
-                lon_max = max(start_loc.longitude, end_loc.longitude) + 2.0
-                
-                is_in_route_box = (lat_min <= station_loc.latitude <= lat_max and 
-                                  lon_min <= station_loc.longitude <= lon_max)
-                
-                # Check polyline proximity
+
+                lat_min = min(start_lat, end_lat) - 2.0
+                lat_max = max(start_lat, end_lat) + 2.0
+                lon_min = min(start_lon, end_lon) - 2.0
+                lon_max = max(start_lon, end_lon) + 2.0
+
+                is_in_route_box = (lat_min <= sta_lat <= lat_max and
+                                  lon_min <= sta_lon <= lon_max)
+
+                # Check polyline proximity using raw haversine
                 is_near_polyline = False
-                if sampled_polyline_coords and (is_near_start or is_near_end or is_in_route_box):
-                    for lat, lon in sampled_polyline_coords:
-                        checkpoint_loc = Location(lat, lon)
-                        dist_to_checkpoint = station_loc.distance_to(checkpoint_loc)
-                        if dist_to_checkpoint <= buffer_miles:
+                if poly_points and (is_near_start or is_near_end or is_in_route_box):
+                    for plat, plon in poly_points:
+                        if _fast_distance_miles(sta_lat, sta_lon, plat, plon) <= buffer_miles:
                             is_near_polyline = True
                             break
                 elif is_near_start or is_near_end or is_in_route_box:
                     is_near_polyline = True
-                
+
                 if is_near_polyline:
                     filtered_stations.append(station)
             
@@ -684,35 +710,67 @@ class FuelOptimizer:
     def decode_route_to_coordinates(polyline_encoded: str) -> List[Tuple[float, float]]:
         """Decode Google encoded polyline to lat/lon coordinates."""
         return polyline.decode(polyline_encoded)
-    
+
     @staticmethod
-    def get_distance_along_route(
-        coordinates: List[Tuple[float, float]],
-        target_lat: float,
-        target_lon: float
-    ) -> float:
+    def precompute_route_distances(
+        polyline_encoded: str
+    ) -> Tuple[List[Tuple[float, float]], List[float], List[Tuple[float, float]], List[float]]:
         """
-        Estimate distance along route to reach target coordinates.
-        
-        Simplified: linear distance from start to target.
-        In production: use route-aware distance (faster, more accurate)
+        Decode polyline and precompute cumulative distances at each waypoint.
+
+        Returns:
+            (all_coords, all_cum_dist, sampled_coords, sampled_cum_dist)
+            - all_coords: all decoded polyline coordinates
+            - all_cum_dist: cumulative distance at each coordinate
+            - sampled_coords: ~200 sampled waypoints for station snapping
+            - sampled_cum_dist: cumulative distance at sampled waypoints
         """
-        cumulative_dist = 0.0
-        min_dist_to_target = float('inf')
-        target_loc = Location(target_lat, target_lon)
-        
-        for i, (lat, lon) in enumerate(coordinates):
-            checkpoint_loc = Location(lat, lon)
-            
-            # Distance to target from this checkpoint
-            dist_to_target = checkpoint_loc.distance_to(target_loc)
-            min_dist_to_target = min(min_dist_to_target, dist_to_target)
-            
-            if i > 0:
-                prev_loc = Location(coordinates[i-1][0], coordinates[i-1][1])
-                cumulative_dist += checkpoint_loc.distance_to(prev_loc)
-        
-        return cumulative_dist
+        coords = polyline.decode(polyline_encoded)
+        if not coords:
+            return [], [], [], []
+
+        cum_dist = [0.0]
+        for i in range(1, len(coords)):
+            d = _fast_distance_miles(coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1])
+            cum_dist.append(cum_dist[-1] + d)
+
+        # Sample ~200 waypoints for efficient station snapping
+        sample_rate = max(1, len(coords) // 200)
+        sampled_coords = coords[::sample_rate]
+        sampled_cum_dist = cum_dist[::sample_rate]
+
+        # Ensure last point is always included
+        if sampled_coords[-1] != coords[-1]:
+            sampled_coords.append(coords[-1])
+            sampled_cum_dist.append(cum_dist[-1])
+
+        return coords, cum_dist, sampled_coords, sampled_cum_dist
+
+    @staticmethod
+    def snap_station_to_route(
+        station_lat: float,
+        station_lon: float,
+        sampled_coords: List[Tuple[float, float]],
+        sampled_cum_dist: List[float]
+    ) -> Tuple[float, float]:
+        """
+        Snap a fuel station to the nearest point along the route polyline.
+
+        Returns:
+            (snapped_distance_miles, detour_miles)
+            - snapped_distance_miles: how far along the route this station is
+            - detour_miles: straight-line distance from station to route
+        """
+        min_dist = float('inf')
+        best_idx = 0
+
+        for i, (lat, lon) in enumerate(sampled_coords):
+            d = _fast_distance_miles(lat, lon, station_lat, station_lon)
+            if d < min_dist:
+                min_dist = d
+                best_idx = i
+
+        return sampled_cum_dist[best_idx], min_dist
     
     @staticmethod
     def calculate_fuel_stops(
@@ -722,276 +780,359 @@ class FuelOptimizer:
         end_location: Location
     ) -> List[FuelStopDetail]:
         """
-        Calculate optimal fuel stops using SMART GREEDY + LOOKAHEAD algorithm.
-        
-        IMPROVED VERSION:
-        - ✅ Smart refueling: Only buy fuel needed to reach cheaper station ahead
-        - ✅ Lookahead analysis: Prevents over-purchasing at expensive stations
-        - ✅ Cost minimization: Minimizes total gallons purchased (not just selects cheapest stop)
-        - ✅ Visited tracking: Prevents duplicate station reuse
-        - ✅ Forward validation: Ensures route ordering
-        
+        Calculate optimal fuel stops using GREEDY + ROUTE-AWARE LOOKAHEAD algorithm.
+
+        KEY ENHANCEMENTS over basic greedy:
+        - ✅ Route-aware distances: snaps stations to polyline for accurate hop calculations
+        - ✅ Proper lookahead: finds cheaper stations ahead (sorted by distance, not price)
+        - ✅ Strategic refueling: buys minimum at expensive stations, fills at cheap ones
+        - ✅ Detour-inclusive fuel consumption: accounts for off-route travel to stations
+        - ✅ Post-processed cost_per_mile: meaningful per-stop efficiency metric
+
         Algorithm:
-        1. Start with full tank (50 gallons, 500-mile range)
-        2. While remaining_distance > current_range:
-           a. Find all reachable stations within LOOKAHEAD_MILES ahead
-           b. For each station, calculate how much fuel is needed to reach it
-           c. Use SMART LOGIC:
-              - If station is expensive AND cheaper station exists ahead → skip (save fuel)
-              - If station is cheapest in lookahead → fill to full tank
-              - Otherwise → buy minimum needed to reach next cheaper station
-           d. Refuel at selected station, mark visited
+        1. Pre-compute cumulative distances along route polyline
+        2. Snap each station to nearest polyline point (route-aware distance)
+        3. Start with full tank
+        4. While destination not reachable on current fuel:
+           a. Find reachable stations (route-aware distance)
+           b. Sort by distance along route (closest first)
+           c. For nearest reachable station:
+              - Look ahead LOOKAHEAD_MILES for cheaper stations
+              - If cheaper found and directly reachable from current → skip this station
+              - If cheaper found but not directly reachable → stop, buy minimum to reach it
+              - If no cheaper ahead → fill up (best price in window)
+           d. If micro-purchase (<5gal) → skip station, try next
            e. Update position and fuel state
-        3. Validate fuel >= required for route
-        
-        Args:
-            route: RouteAlternative object
-            available_stations: Filtered fuel stations with prices
-            start_location: Route start
-            end_location: Route end
-            
-        Returns:
-            List of FuelStopDetail objects (ordered by mile_marker)
+        5. Post-process cost_per_mile for each stop
+        6. Validate fuel accounting
         """
         logger.info(f"Optimizing fuel stops for {route.route_id} ({route.distance_miles:.1f} miles)")
-        
+
+        # =====================================================================
+        # STEP 0: Build route-aware distance lookup for all stations
+        # =====================================================================
+        all_coords, cum_distances, sampled_coords, sampled_cum_dist = \
+            FuelOptimizer.precompute_route_distances(route.polyline_encoded) \
+            if route.polyline_encoded else ([], [], [], [])
+
+        has_route_data = len(sampled_coords) > 0
+
+        # Build snapped distance lookup — use pre-snapped data if available
+        # (pre-snapped by optimize() to avoid double work), otherwise snap now
+        station_route_data = {}
+        for station in available_stations:
+            if '_snapped_distance' in station:
+                snapped_dist = station['_snapped_distance']
+                detour = station.get('_detour_miles', 0.0)
+            elif has_route_data:
+                snapped_dist, detour = FuelOptimizer.snap_station_to_route(
+                    float(station['latitude']),
+                    float(station['longitude']),
+                    sampled_coords,
+                    sampled_cum_dist
+                )
+            else:
+                snapped_dist = _fast_distance_miles(
+                    start_location.latitude, start_location.longitude,
+                    float(station['latitude']), float(station['longitude'])
+                )
+                detour = 0.0
+
+            station_route_data[station['opis_id']] = {
+                'snapped_distance': snapped_dist,
+                'detour_miles': detour,
+            }
+
         stops = []
         visited_stations = set()
-        current_location = start_location
-        current_distance = 0.0
-        
-        # ✅ CRITICAL ASSUMPTION: Vehicle starts with FULL TANK (50 gallons)
-        current_fuel = VEHICLE_TANK  # 50 gallons at start
-        current_range = VEHICLE_MAX_RANGE  # 500 miles per full tank
-        
-        total_fuel_purchased = 0.0  # Track for final verification
-        
+
+        # Vehicle starts with FULL TANK
+        current_fuel = VEHICLE_TANK  # 50 gallons
+        current_position = 0.0  # Miles along route from start
+
+        total_fuel_purchased = 0.0
+
         iteration = 0
         estimated_stops_needed = max(1, int(route.distance_miles / VEHICLE_MAX_RANGE) + 2)
         max_iterations = max(100, min(200, estimated_stops_needed * 20))
         logger.info(
-            f"Route {route.distance_miles:.1f}mi: Starting with {current_fuel:.0f}gal full tank, "
+            f"Route {route.distance_miles:.1f}mi: {len(available_stations)} stations pre-snapped, "
+            f"starting with {current_fuel:.0f}gal full tank, "
             f"estimated {estimated_stops_needed} stops, {max_iterations} iteration limit"
         )
-        
-        while current_distance < route.distance_miles and iteration < max_iterations:
+
+        while current_position < route.distance_miles and iteration < max_iterations:
             iteration += 1
-            remaining_distance = route.distance_miles - current_distance
-            
-            # Check if we can reach end without refueling
-            if remaining_distance <= current_range:
+            remaining_distance = route.distance_miles - current_position
+            remaining_range = current_fuel * VEHICLE_MPG
+
+            # Check if we can reach destination without refueling
+            if remaining_distance <= remaining_range:
                 logger.debug(
-                    f"✓ Can reach destination: {remaining_distance:.1f}mi remaining ≤ "
-                    f"{current_range:.1f}mi range. Fuel at arrival: {current_fuel - (remaining_distance / VEHICLE_MPG):.1f}gal"
+                    f"✓ Destination reachable: {remaining_distance:.1f}mi remaining ≤ "
+                    f"{remaining_range:.1f}mi range"
                 )
                 break
-            
-            # ✅ SMART LOOKAHEAD: Build candidate list with price intelligence
+
+            # =================================================================
+            # STEP 1: Build candidate list with route-aware distances
+            # =================================================================
             candidates = []
             for station in available_stations:
-                # Skip visited stations
-                if station['opis_id'] in visited_stations:
+                opis_id = station['opis_id']
+                if opis_id in visited_stations:
                     continue
-                
-                station_loc = Location(station['latitude'], station['longitude'])
-                dist_to_station = current_location.distance_to(station_loc)
-                
-                # Skip if unreachable
-                if dist_to_station > current_range - VEHICLE_RESERVE_MILES:
+
+                route_info = station_route_data[opis_id]
+                snapped_distance = route_info['snapped_distance']
+                detour_miles = route_info['detour_miles']
+
+                # Station must be ahead of current position
+                if snapped_distance <= current_position:
                     continue
-                
-                # Only consider stations ahead
-                est_distance_from_start = current_distance + dist_to_station
-                if est_distance_from_start <= current_distance:
+
+                # Effective distance includes detour (off-route and back)
+                distance_along_route = snapped_distance - current_position
+
+                # ✅ FIX: Skip stations where detour exceeds forward progress
+                # Prevents wasteful stops that burn fuel on off-route travel
+                # Example: 30mi detour for 10mi forward = 60mi detour loop, not worth it
+                if detour_miles > distance_along_route:
                     continue
-                
-                price = Decimal(str(station['price_per_gallon']))
-                
-                # Calculate fuel needed to reach this station
-                fuel_needed_to_reach = dist_to_station / VEHICLE_MPG
+
+                effective_distance = distance_along_route + 2.0 * detour_miles
+
+                # Fuel needed considering detour
+                fuel_needed_to_reach = effective_distance / VEHICLE_MPG
+
+                # Check reachable (with reserve buffer)
+                max_fuel_for_travel = current_fuel - (VEHICLE_RESERVE_MILES / VEHICLE_MPG)
+                if fuel_needed_to_reach > max_fuel_for_travel:
+                    continue
+
                 fuel_at_arrival = current_fuel - fuel_needed_to_reach
-                
+                price = Decimal(str(station['price_per_gallon']))
+
                 candidates.append({
                     'station': station,
-                    'distance_from_start': est_distance_from_start,
-                    'detour_miles': dist_to_station,
+                    'distance_from_start': snapped_distance,
+                    'detour_miles': detour_miles,
                     'price': price,
                     'fuel_at_arrival': fuel_at_arrival,
+                    'fuel_needed': fuel_needed_to_reach,
                 })
-            
+
             if not candidates:
                 logger.warning(
-                    f"No reachable unvisited stations at {current_distance:.1f}mi. "
+                    f"No reachable unvisited stations at position {current_position:.1f}mi. "
                     f"Visited: {len(visited_stations)}, Remaining: {remaining_distance:.1f}mi, "
-                    f"Current fuel: {current_fuel:.1f}gal, Range: {current_range:.1f}mi"
+                    f"Fuel: {current_fuel:.1f}gal"
                 )
                 break
-            
-            # ✅ SMART SELECTION: Implement lookahead pricing intelligence
-            # Sort by price (cheapest first)
-            candidates.sort(key=lambda x: x['price'])
-            cheapest_station = candidates[0]
-            
-            # ✅ LOOKAHEAD ANALYSIS: Look ahead within LOOKAHEAD_MILES
-            # If current cheapest station is expensive AND we can skip it to reach cheaper ahead
-            # → only buy minimum fuel to reach next cheaper station (don't fill up)
-            
-            # Find cheapest station within lookahead distance
-            lookahead_start = cheapest_station['distance_from_start']
-            lookahead_end = lookahead_start + LOOKAHEAD_MILES
-            
-            cheaper_ahead = None
-            for station in candidates[1:]:  # Skip the cheapest we already found
-                if station['distance_from_start'] <= lookahead_end:
-                    if station['price'] <= cheapest_station['price']:
-                        # Found same/cheaper station ahead
-                        cheaper_ahead = station
-                        break
-            
-            # Mark current station as visited
-            visited_stations.add(cheapest_station['station']['opis_id'])
-            
-            # Validate fuel arrival
-            fuel_after_arrival = cheapest_station['fuel_at_arrival']
-            if fuel_after_arrival < 0:
-                logger.warning(
-                    f"Insufficient fuel to reach {cheapest_station['station']['name']}: "
-                    f"need {cheapest_station['detour_miles']/VEHICLE_MPG:.1f}gal, have {current_fuel:.1f}gal"
-                )
-                continue  # Try next cheapest
-            
-            # ✅ SMART REFUELING LOGIC:
-            remaining_to_end = route.distance_miles - cheapest_station['distance_from_start']
-            
-            if cheaper_ahead:
-                # Cheaper station exists ahead → don't fill up, just buy minimum
-                # Calculate: fuel needed to reach cheaper station + small buffer (20 miles)
-                dist_to_cheaper = cheaper_ahead['distance_from_start'] - cheapest_station['distance_from_start']
-                fuel_needed_to_cheaper = (dist_to_cheaper + 20) / VEHICLE_MPG
-                fuel_to_buy = max(0, fuel_needed_to_cheaper - fuel_after_arrival)
-                
+
+            # =================================================================
+            # STEP 2: Greedy + Lookahead selection (sorted by DISTANCE, not price)
+            # =================================================================
+            candidates.sort(key=lambda x: x['distance_from_start'])
+
+            selected = None
+            selected_strategy = None  # 'fill' or 'partial'
+            target_cheaper = None
+
+            for candidate in candidates:
+                station_distance = candidate['distance_from_start']
+                lookahead_limit = station_distance + LOOKAHEAD_MILES
+
+                # Look for cheaper stations within lookahead window
+                cheaper_ahead = None
+                for other in candidates:
+                    if other['distance_from_start'] > station_distance and \
+                       other['distance_from_start'] <= lookahead_limit:
+                        if other['price'] < candidate['price']:
+                            if cheaper_ahead is None or other['price'] < cheaper_ahead['price']:
+                                cheaper_ahead = other
+
+                if cheaper_ahead:
+                    # Cheaper station exists within lookahead
+                    # Can we skip this station entirely and go directly to cheaper?
+                    if cheaper_ahead['fuel_at_arrival'] >= 0:
+                        logger.debug(
+                            f"Skipping {candidate['station']['name']} (@{candidate['price']:.3f}) - "
+                            f"can reach cheaper {cheaper_ahead['station']['name']} (@{cheaper_ahead['price']:.3f}) directly"
+                        )
+                        continue  # Skip this station entirely
+
+                    # Can't skip - stop here, buy minimum to reach cheaper station
+                    selected = candidate
+                    selected_strategy = 'partial'
+                    target_cheaper = cheaper_ahead
+                    break
+                else:
+                    # No cheaper station within lookahead - this is the best price
+                    selected = candidate
+                    selected_strategy = 'fill'
+                    break
+
+            if selected is None:
+                # No strategic candidate - fallback to closest reachable
+                if candidates:
+                    selected = candidates[0]
+                    selected_strategy = 'fill'
+                    logger.warning(f"No strategic candidate, using closest station as fallback")
+                else:
+                    break
+
+            # =================================================================
+            # STEP 3: Calculate refuel amount based on strategy
+            # =================================================================
+            fuel_at_arrival = selected['fuel_at_arrival']
+
+            if selected_strategy == 'partial' and target_cheaper:
+                # Buy minimum fuel to reach the cheaper station ahead (+20mi buffer)
+                dist_to_cheaper = target_cheaper['distance_from_start'] - selected['distance_from_start']
+                fuel_needed_to_cheaper = (dist_to_cheaper + 20.0) / VEHICLE_MPG
+                fuel_to_buy = max(0.0, min(
+                    fuel_needed_to_cheaper - fuel_at_arrival,
+                    float(VEHICLE_TANK) - fuel_at_arrival  # Never exceed tank capacity
+                ))
+
                 logger.debug(
-                    f"SMART: {cheapest_station['station']['name']} is expensive. "
-                    f"Cheaper station {cheaper_ahead['distance_from_start']:.1f}mi ahead. "
-                    f"Buy {fuel_to_buy:.1f}gal (min to reach cheaper)"
+                    f"PARTIAL: {selected['station']['name']} (@{selected['price']:.3f}) is expensive. "
+                    f"Cheaper {target_cheaper['station']['name']} (@{target_cheaper['price']:.3f}) "
+                    f"{dist_to_cheaper:.0f}mi ahead. Buy {fuel_to_buy:.1f}gal (min to reach cheaper)"
                 )
             else:
-                # No cheaper station ahead → fill to full tank
-                fuel_to_buy = max(0, VEHICLE_TANK - fuel_after_arrival)
+                # Fill up to full tank
+                fuel_to_buy = max(0.0, float(VEHICLE_TANK) - fuel_at_arrival)
                 logger.debug(
-                    f"SMART: {cheapest_station['station']['name']} is best ahead. "
+                    f"FILL: {selected['station']['name']} (@{selected['price']:.3f}) is best ahead. "
                     f"Fill to full tank: buy {fuel_to_buy:.1f}gal"
                 )
-            
-            # ✅ FIX: Prevent micro-purchases with 5-gallon minimum
-            # If purchasing < 5 gallons, it's not worth stopping
+
+            # Skip micro-purchases (< 5 gallons not worth stopping for)
             if fuel_to_buy < 5.0:
                 logger.debug(
-                    f"Skip micro-refuel at {cheapest_station['station']['name']}: "
+                    f"Skip micro-refuel at {selected['station']['name']}: "
                     f"would only buy {fuel_to_buy:.1f}gal (< 5gal minimum)"
                 )
+                visited_stations.add(selected['station']['opis_id'])
                 continue
-            
-            # ✅ PRECISE COST CALCULATION (FIX FOR ISSUE #1)
-            # Use Decimal throughout to avoid precision errors
-            fuel_to_buy_decimal = Decimal(str(fuel_to_buy))
+
+            # ✅ FIX: Skip stops too close to last position after a fill-up
+            # Prevents clustering like stops 10mi apart (wastes time, adds no value)
+            # Only applies when we have plenty of fuel and the stop is very close
+            distance_from_last = selected['distance_from_start'] - current_position
+            if distance_from_last < 80 and current_fuel > VEHICLE_TANK * 0.6:
+                logger.debug(
+                    f"Skip tight stop at {selected['station']['name']}: "
+                    f"only {distance_from_last:.0f}mi from last stop with {current_fuel:.1f}gal remaining "
+                    f"(need >{fuel_to_buy:.1f}gal stop for only {distance_from_last:.0f}mi travel)"
+                )
+                visited_stations.add(selected['station']['opis_id'])
+                continue
+
+            # Mark as visited (only after confirming it's a real stop)
+            visited_stations.add(selected['station']['opis_id'])
+
+            # =================================================================
+            # STEP 4: Precise cost calculation (Decimal throughout)
+            # =================================================================
             fuel_to_buy_rounded = Decimal(str(round(fuel_to_buy, 1)))
-            price_decimal = cheapest_station['price']
-            if not isinstance(price_decimal, Decimal):
-                price_decimal = Decimal(str(price_decimal))
-            
-            # Calculate cost using ROUNDED gallons (what appears in response)
+            price_decimal = selected['price']
+
             cost_decimal = price_decimal * fuel_to_buy_rounded
-            cost = float(cost_decimal)
-            
-            # After refueling, fuel state depends on refuel amount
-            fuel_after_refuel = fuel_after_arrival + fuel_to_buy
-            
-            # ✅ Calculate detour_miles and cost_per_mile with proper defaults
-            detour_miles = cheapest_station.get('detour_miles', 0.0)
-            if not detour_miles or detour_miles is None:
-                detour_miles = 0.0
-            
-            distance_for_cost = cheapest_station['distance_from_start']
-            cost_per_mile = float(cost) / distance_for_cost if distance_for_cost > 0 else 0.0
-            
+
+            fuel_after_refuel = fuel_at_arrival + fuel_to_buy
+
+            # Detour miles with safe default
+            detour_miles = selected.get('detour_miles', 0.0) or 0.0
+
             stop = FuelStopDetail(
-                opis_id=cheapest_station['station']['opis_id'],
-                station_name=cheapest_station['station']['name'],
-                city=cheapest_station['station']['city'],
-                state=cheapest_station['station']['state'],
-                address=cheapest_station['station'].get('address', ''),
-                latitude=cheapest_station['station']['latitude'],
-                longitude=cheapest_station['station']['longitude'],
-                price_per_gallon=cheapest_station['price'],
-                distance_from_start=cheapest_station['distance_from_start'],
-                mile_marker=cheapest_station['distance_from_start'],
+                opis_id=selected['station']['opis_id'],
+                station_name=selected['station']['name'],
+                city=selected['station']['city'],
+                state=selected['station']['state'],
+                address=selected['station'].get('address', ''),
+                latitude=float(selected['station']['latitude']),
+                longitude=float(selected['station']['longitude']),
+                price_per_gallon=price_decimal,
+                distance_from_start=selected['distance_from_start'],
+                mile_marker=selected['distance_from_start'],
                 gallons_to_buy=fuel_to_buy,
-                fuel_cost=cost,
-                fuel_remaining_at_arrival=fuel_after_arrival,
-                range_remaining_at_arrival=fuel_after_arrival * VEHICLE_MPG,
+                fuel_cost=cost_decimal,  # ✅ Kept as Decimal
+                fuel_remaining_at_arrival=fuel_at_arrival,
+                fuel_after_refuel=fuel_after_refuel,  # Tank level after refueling
+                range_remaining_at_arrival=fuel_at_arrival * VEHICLE_MPG,
                 remaining_range_after_fill=fuel_after_refuel * VEHICLE_MPG,
                 detour_miles=detour_miles,
-                cost_per_mile=cost_per_mile
+                cost_per_mile=0.0,  # Post-processed below
             )
-            
+
             stops.append(stop)
-            
-            # ✅ Update state after refueling
-            old_distance = current_distance
-            current_fuel = fuel_after_refuel  # Updated fuel after purchase
+
+            # =================================================================
+            # STEP 5: Update position and fuel state
+            # =================================================================
+            old_position = current_position
+            current_fuel = fuel_after_refuel
             total_fuel_purchased += fuel_to_buy
-            current_distance = cheapest_station['distance_from_start']
-            current_location = Location(
-                float(cheapest_station['station']['latitude']),
-                float(cheapest_station['station']['longitude'])
-            )
-            current_range = fuel_after_refuel * VEHICLE_MPG  # Updated range based on actual fuel
-            
+            current_position = selected['distance_from_start']
+
             # Validate forward progress
-            if current_distance <= old_distance:
-                logger.error(f"Route progression error: {old_distance:.1f} → {current_distance:.1f}")
-                stops.pop()
+            if current_position <= old_position:
+                logger.error(f"Route progression error: {old_position:.1f} → {current_position:.1f}")
+                if stops:
+                    stops.pop()
                 continue
-            
+
             logger.debug(
-                f"Stop {len(stops)}: {stop.station_name} at {current_distance:.1f}mi - "
-                f"Buy {round(fuel_to_buy, 1):.1f}gal @ ${float(cheapest_station['price']):.3f} = ${cost:.2f}"
+                f"Stop {len(stops)}: {stop.station_name} at {current_position:.1f}mi - "
+                f"Buy {round(fuel_to_buy, 1)}gal @ ${float(price_decimal):.3f} = ${float(cost_decimal):.2f}"
             )
-        
-        # ✅ Final validation
+
+        # =====================================================================
+        # POST-PROCESSING: Calculate meaningful cost_per_mile for each stop
+        # =====================================================================
+        for i, stop in enumerate(stops):
+            if i < len(stops) - 1:
+                next_dist = stops[i + 1].distance_from_start
+            else:
+                next_dist = route.distance_miles
+
+            segment_distance = next_dist - stop.distance_from_start
+            if segment_distance > 0:
+                stop.cost_per_mile = round(float(stop.fuel_cost) / segment_distance, 3)
+            else:
+                stop.cost_per_mile = 0.0
+
+        # =====================================================================
+        # FINAL VALIDATION
+        # =====================================================================
         if iteration >= max_iterations:
             logger.warning(f"Hit iteration limit ({max_iterations}) - possible infinite loop")
-        
-        # ✅ ========================================================================
-        # ✅ FINAL FUEL STATE VALIDATION
-        # ========================================================================
-        # ASSUMPTION: Vehicle starts with a FULL TANK (50 gallons)
-        # This is the ONLY assumption about fuel state in the entire algorithm
-        # All calculations depend on this being true
+
         total_fuel_needed = route.distance_miles / VEHICLE_MPG
         fuel_purchased_at_stops = sum(round(s.gallons_to_buy, 1) for s in stops)
         total_fuel_available = VEHICLE_TANK + fuel_purchased_at_stops
-        
+
         logger.info(
             f"✅ FUEL STATE VERIFICATION:\n"
-            f"   Starting fuel (ASSUMPTION): {VEHICLE_TANK:.1f} gallons (full tank)\n"
+            f"   Starting fuel: {VEHICLE_TANK:.1f} gallons (full tank)\n"
             f"   Fuel purchased at stops: {fuel_purchased_at_stops:.1f} gallons\n"
             f"   Total fuel available: {total_fuel_available:.1f} gallons\n"
             f"   Fuel needed for {route.distance_miles:.1f} miles: {total_fuel_needed:.1f} gallons\n"
             f"   Safety margin: {total_fuel_available - total_fuel_needed:.1f} gallons"
         )
-        
-        # ✅ Calculate stop efficiency
+
+        # Stop efficiency
         optimal_stops = max(1, int(route.distance_miles / VEHICLE_MAX_RANGE) + 1)
         stop_efficiency = (optimal_stops / len(stops) * 100) if stops else 100
-        avg_fuel_per_stop = (sum(round(s.gallons_to_buy, 1) for s in stops) / len(stops)) if stops else 0
-        
+
         logger.info(
             f"✓ Stop efficiency: {len(stops)} stops generated, {optimal_stops} optimal "
-            f"({stop_efficiency:.0f}% efficiency), avg {avg_fuel_per_stop:.1f}gal/stop"
+            f"({stop_efficiency:.0f}% efficiency)"
         )
-        
+
         if total_fuel_available < total_fuel_needed:
             shortage = total_fuel_needed - total_fuel_available
             logger.error(
@@ -1001,33 +1142,23 @@ class FuelOptimizer:
             )
         else:
             logger.info(f"✓ Fuel plan valid: {total_fuel_available:.1f}gal available vs {total_fuel_needed:.1f}gal needed")
-        
-        # ✅ Validate stops are ordered
-        for i in range(len(stops) - 1):
-            if stops[i].distance_from_start >= stops[i+1].distance_from_start:
-                logger.error(
-                    f"Stop ordering error: Stop {i} at {stops[i].distance_from_start:.1f}mi "
-                    f"≥ Stop {i+1} at {stops[i+1].distance_from_start:.1f}mi"
-                )
-        
-        # ✅ CRITICAL FIX: Filter out stops with zero fuel purchased
-        # If gallons_to_buy = 0, this is not a real stop (skip marker)
-        # This prevents empty stops from appearing in the response
+
+        # Filter zero-fuel stops (safety check)
         stops_before_filter = len(stops)
         stops = [s for s in stops if s.gallons_to_buy > 0.01]
         if len(stops) < stops_before_filter:
             logger.info(f"Filtered out {stops_before_filter - len(stops)} zero-fuel stops")
-        
-        # ✅ Calculate total cost using ROUNDED gallons (Issue #1 fix)
+
+        # Recalculate total cost (Issue #1 fix: use rounded gallons)
         total_cost_decimal = Decimal('0')
         for s in stops:
             gallons_rounded = Decimal(str(round(s.gallons_to_buy, 1)))
             price_decimal = s.price_per_gallon if isinstance(s.price_per_gallon, Decimal) else Decimal(str(s.price_per_gallon))
             stop_cost = price_decimal * gallons_rounded
             total_cost_decimal += stop_cost
-        
+
         total_cost = float(total_cost_decimal)
-        
+
         logger.info(
             f"Calculated {len(stops)} fuel stops, total cost: ${total_cost:.2f}, "
             f"fuel purchased: {fuel_purchased_at_stops:.1f}gal, fuel needed: {total_fuel_needed:.1f}gal"
@@ -1193,6 +1324,13 @@ class FuelRouteOptimizationEngine:
                 logger.info(f"[{request_id}] ⚡⚡⚡ ULTRA-CACHE HIT - returning in <1ms")
                 return cached_result
             
+            # ✅ Validate API key before making any external calls
+            if not GOOGLE_API_KEY or GOOGLE_API_KEY == 'your_google_maps_api_key_here':
+                raise ValueError(
+                    "Google Maps API key not configured. "
+                    "Set GOOGLE_MAPS_API_KEY in your environment or .env file."
+                )
+
             # Parse location display info
             start_city, start_state, start_formatted = FuelRouteOptimizationEngine._parse_location_for_display(start_input)
             end_city, end_state, end_formatted = FuelRouteOptimizationEngine._parse_location_for_display(end_input)
@@ -1231,8 +1369,22 @@ class FuelRouteOptimizationEngine:
                 
                 # Calculate estimated fuel consumption for this route
                 estimated_fuel = best_route.distance_miles / VEHICLE_MPG
-                # Estimate cost using average US fuel price (~$3.45/gallon)
-                estimated_cost = estimated_fuel * 3.45
+
+                # Use actual average fuel price from DB instead of hardcoded estimate
+                avg_price_per_gal = 3.45  # fallback default
+                try:
+                    price_version = PriceVersion.objects.filter(is_active=True).first()
+                    if price_version:
+                        avg_result = FuelPrice.objects.filter(
+                            version=price_version
+                        ).aggregate(avg_price=Avg('price_per_gallon'))
+                        db_avg = avg_result.get('avg_price')
+                        if db_avg is not None:
+                            avg_price_per_gal = float(db_avg)
+                except Exception:
+                    pass  # Keep fallback
+
+                estimated_cost = estimated_fuel * avg_price_per_gal
                 
                 response = {
                     'request': {
@@ -1262,7 +1414,7 @@ class FuelRouteOptimizationEngine:
                         {
                             'route_id': r.route_id,
                             'distance_miles': round(r.distance_miles, 1),
-                            'estimated_total_fuel_cost': float((r.distance_miles / VEHICLE_MPG) * 3.45),
+                            'estimated_total_fuel_cost': float((r.distance_miles / VEHICLE_MPG) * avg_price_per_gal),
                             'fuel_stops_required': 0,
                             'selected': r.route_id == best_route.route_id
                         }
@@ -1273,7 +1425,7 @@ class FuelRouteOptimizationEngine:
                         'total_distance_miles': round(best_route.distance_miles, 1),
                         'total_fuel_consumed_gallons': round(estimated_fuel, 1),
                         'total_fuel_cost': float(estimated_cost),
-                        'average_price_per_gallon': 3.45,  # Default estimate when no stops
+                        'average_price_per_gallon': round(avg_price_per_gal, 3),  # Actual DB average
                         'total_fuel_stops': 0,
                         
                         # ✅ FIX 8: FUEL ACCOUNTING FOR SHORT ROUTES (no stops needed)
@@ -1372,21 +1524,24 @@ class FuelRouteOptimizationEngine:
                 merged_lon_max = max(start_loc.longitude, end_loc.longitude)
                 logger.info(f"[{request_id}] Fallback bounding box: ({merged_lat_min:.4f}, {merged_lon_min:.4f}) to ({merged_lat_max:.4f}, {merged_lon_max:.4f})")
             
-            # ✅ Query stations ONCE using merged bounding box
+            # ✅ Query stations ONCE using merged bounding box + price filter
             logger.info(f"[{request_id}] Querying stations for merged corridor (covers all {len(routes)} routes)...")
             all_route_stations = []
             try:
+                # Only load stations that have active prices (avoids loading useless rows)
+                opis_ids_with_prices = list(all_prices.keys())
                 candidate_stations = FuelStation.objects.filter(
                     is_active=True,
+                    opis_id__in=opis_ids_with_prices,
                     latitude__gte=merged_lat_min - 3.0,
                     latitude__lte=merged_lat_max + 3.0,
                     longitude__gte=merged_lon_min - 3.0,
                     longitude__lte=merged_lon_max + 3.0
-                ).values('opis_id', 'name', 'address', 'city', 'state', 'latitude', 'longitude')
-                
-                logger.info(f"[{request_id}] Loaded {candidate_stations.count()} candidate stations from merged bounding box")
-                
+                ).values('opis_id', 'name', 'address', 'city', 'state', 'latitude', 'longitude').iterator()
+
+                station_count = 0
                 for station in candidate_stations:
+                    station_count += 1
                     price = all_prices.get(station['opis_id'])
                     if price and price > 0:
                         all_route_stations.append({
@@ -1395,14 +1550,16 @@ class FuelRouteOptimizationEngine:
                             'address': station.get('address', ''),
                             'city': station['city'],
                             'state': station['state'],
-                            'latitude': station['latitude'],
-                            'longitude': station['longitude'],
+                            'latitude': float(station['latitude']),
+                            'longitude': float(station['longitude']),
                             'price_per_gallon': price,
                         })
+
+                logger.info(f"[{request_id}] Queried {station_count} stations, {len(all_route_stations)} with valid prices")
             except Exception as e:
                 logger.warning(f"Failed to load merged station set: {e}")
                 all_route_stations = []
-            
+
             logger.info(f"[{request_id}] Shared station pool: {len(all_route_stations)} stations with valid prices")
             
             route_optimizations = []
@@ -1415,6 +1572,23 @@ class FuelRouteOptimizationEngine:
                 logger.info(f"[{request_id}] Filtering {len(all_route_stations)} stations for {route.route_id} corridor...")
                 route_stations = FuelStationQueryService.filter_stations_by_route(route, all_route_stations)
                 logger.info(f"[{request_id}] Found {len(route_stations)} stations in corridor for {route.route_id}")
+
+                # ✅ PERFORMANCE: Pre-snap stations to route ONCE (avoids re-snapping in optimizer)
+                if route_stations and route.polyline_encoded:
+                    _, _, sampled_coords, sampled_cum_dist = FuelOptimizer.precompute_route_distances(
+                        route.polyline_encoded
+                    )
+                    pre_snap_start = time.time()
+                    for station in route_stations:
+                        snapped_dist, detour = FuelOptimizer.snap_station_to_route(
+                            float(station['latitude']),
+                            float(station['longitude']),
+                            sampled_coords,
+                            sampled_cum_dist
+                        )
+                        station['_snapped_distance'] = snapped_dist
+                        station['_detour_miles'] = detour
+                    logger.info(f"[{request_id}] Pre-snapped {len(route_stations)} stations in {(time.time() - pre_snap_start)*1000:.0f}ms")
                 
                 if not route_stations:
                     logger.warning(f"[{request_id}] No stations found for {route.route_id} - using empty stops")
@@ -1430,7 +1604,7 @@ class FuelRouteOptimizationEngine:
                     )
                     logger.info(f"[{request_id}] {route.route_id}: {len(stops)} stops generated")
                 
-                total_cost = sum(s.fuel_cost for s in stops)
+                total_cost = float(sum(s.fuel_cost for s in stops))
                 logger.info(f"[{request_id}] {route.route_id} total cost: ${total_cost:.2f}")
                 route_optimizations.append((route, stops, total_cost))
             
@@ -1528,7 +1702,7 @@ class FuelRouteOptimizationEngine:
                     'route_id': selected_route.route_id,
                     'distance_miles': round(selected_route.distance_miles, 1),
                     'is_optimal': True,
-                    'reason': 'Lowest total fuel cost',
+                    'reason': 'Lowest cost-per-mile efficiency',
                     'estimated_total_fuel_consumption_gallons': round(selected_route.distance_miles / VEHICLE_MPG, 1),
                     'estimated_total_fuel_cost': response_total_cost,  # ✅ Use recalculated cost (Issue #2 fix)
                     'fuel_stops_required': len(selected_stops),
@@ -1584,9 +1758,16 @@ class FuelRouteOptimizationEngine:
                     'fuel_purchased_at_stops': round(sum(round(s.gallons_to_buy, 1) for s in selected_stops), 1),
                     'total_fuel_available': round(VEHICLE_TANK + sum(round(s.gallons_to_buy, 1) for s in selected_stops), 1),
                     'total_fuel_consumed_gallons': round(selected_route.distance_miles / VEHICLE_MPG, 1),
+                    # ✅ FIX: Actual fuel remaining in tank at destination (not cumulative balance)
+                    # Uses last stop's fuel_after_refuel minus final leg consumption
+                    # Previously used VEHICLE_TANK + sum(purchases) - consumption which
+                    # could exceed the 50-gallon tank capacity (e.g., showing 51.9gal)
                     'fuel_remaining_at_destination': round(
-                        VEHICLE_TANK + sum(round(s.gallons_to_buy, 1) for s in selected_stops) - 
-                        (selected_route.distance_miles / VEHICLE_MPG), 1
+                        (
+                            (float(selected_stops[-1].fuel_after_refuel) if selected_stops else float(VEHICLE_TANK))
+                            -
+                            (selected_route.distance_miles - (selected_stops[-1].distance_from_start if selected_stops else 0)) / VEHICLE_MPG
+                        ), 1
                     ),
                 }
             }

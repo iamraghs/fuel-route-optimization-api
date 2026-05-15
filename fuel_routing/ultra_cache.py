@@ -18,7 +18,13 @@ class UltraFastCache:
     @staticmethod
     def make_optimization_key(start_input, end_input, route_id=None):
         """Create cache key for optimization request."""
-        key_str = f"opt:v3:{str(start_input)}:{str(end_input)}"
+        # Normalize dict inputs for deterministic key ordering
+        def normalize_input(val):
+            if isinstance(val, dict):
+                return json.dumps(val, sort_keys=True, default=str)
+            return str(val).lower().strip()
+
+        key_str = f"opt:v3:{normalize_input(start_input)}:{normalize_input(end_input)}"
         if route_id:
             key_str += f":{route_id}"
         return hashlib.md5(key_str.encode()).hexdigest()
@@ -46,23 +52,23 @@ class UltraFastCache:
     @staticmethod
     def get_cached_route(start_loc, end_loc):
         """Get cached route geometry if available."""
-        key = f"route:v3:{start_loc}:{end_loc}"
+        key = f"route:v3:{str(start_loc)}:{str(end_loc)}"
         result = cache.get(key)
         if result:
             logger.info(f"🚀 CACHE HIT (route): {key[:8]}...")
             return result
         return None
-    
+
     @staticmethod
     def cache_route(start_loc, end_loc, result, ttl=None):
         """Cache route geometry."""
         if ttl is None:
             ttl = UltraFastCache.ROUTE_TTL
-        
-        key = f"route:v3:{start_loc}:{end_loc}"
+
+        key = f"route:v3:{str(start_loc)}:{str(end_loc)}"
         cache.set(key, result, ttl)
         logger.info(f"💾 CACHED (route): {key[:8]}... for {ttl}s")
-    
+
     @staticmethod
     def get_cached_geocode(address):
         """Get cached geocoding result."""
@@ -72,13 +78,13 @@ class UltraFastCache:
             logger.info(f"🚀 CACHE HIT (geocode): {key[:8]}...")
             return result
         return None
-    
+
     @staticmethod
     def cache_geocode(address, result, ttl=None):
         """Cache geocoding result."""
         if ttl is None:
             ttl = UltraFastCache.GEOCODE_TTL
-        
+
         key = f"geocode:v3:{address.lower().strip()}"
         cache.set(key, result, ttl)
         logger.info(f"💾 CACHED (geocode): {key[:8]}... for {ttl}s")
