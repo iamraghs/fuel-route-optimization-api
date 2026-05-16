@@ -1718,11 +1718,12 @@ class FuelRouteOptimizationEngine:
 
             # ✅ FIX: Pre-compute fuel accounting for consistency
             # Uses tank state model so available − consumed = remaining
+            # Note: detour_out of last stop is already accounted for in the
+            # 2*detour convention during stop processing — do NOT add it again.
             if selected_stops:
                 last_stop_fuel_after = float(selected_stops[-1].fuel_after_refuel)
                 last_stop_dist = selected_stops[-1].distance_from_start
-                last_stop_detour = float(selected_stops[-1].detour_miles if selected_stops[-1].detour_miles is not None else 0.0)
-                final_leg_miles = (selected_route.distance_miles - last_stop_dist) + last_stop_detour
+                final_leg_miles = selected_route.distance_miles - last_stop_dist
                 fuel_remaining_val = max(0.0, last_stop_fuel_after - final_leg_miles / VEHICLE_MPG)
             elif no_stations_available:
                 fuel_remaining_val = 0.0  # Stranded without stations

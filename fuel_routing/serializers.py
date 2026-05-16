@@ -32,30 +32,44 @@ class FuelStopSerializer(serializers.Serializer):
     fuel_price_per_gallon = serializers.SerializerMethodField()
     gallons_to_buy = serializers.SerializerMethodField()
     fuel_cost = serializers.SerializerMethodField()
-    
+    detour_miles = serializers.SerializerMethodField()
+    cost_per_mile = serializers.SerializerMethodField()
+
     def get_mile_marker(self, obj):
         """Round mile marker to 1 decimal place."""
         value = obj.get('mile_marker', 0)
         return round(float(value), 1)
-    
+
     def get_fuel_price_per_gallon(self, obj):
         """Format price to 2 decimal places (cents)."""
         value = obj.get('fuel_price_per_gallon', 0)
         if isinstance(value, Decimal):
             return float(value)
         return round(float(value), 2)
-    
+
     def get_gallons_to_buy(self, obj):
         """Round gallons to 1 decimal place."""
         value = obj.get('gallons_to_buy', 0)
         return round(float(value), 1)
-    
+
     def get_fuel_cost(self, obj):
         """Round cost to 2 decimal places (cents)."""
         value = obj.get('fuel_cost', 0)
         if isinstance(value, Decimal):
             return float(value)
         return round(float(value), 2)
+
+    def get_detour_miles(self, obj):
+        """Detour miles from highway to station (round trip = 2x)."""
+        value = obj.get('detour_miles', 0)
+        return round(float(value), 1)
+
+    def get_cost_per_mile(self, obj):
+        """Fuel cost per mile for this stop segment."""
+        value = obj.get('cost_per_mile', 0)
+        if isinstance(value, Decimal):
+            return float(value)
+        return round(float(value), 3)
 
 
 class SelectedRouteSerializer(serializers.Serializer):
