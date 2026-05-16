@@ -900,6 +900,12 @@ class FuelOptimizer:
                 if detour_miles > distance_along_route:
                     continue
 
+                # ✅ FIX: Enforce MAX_DETOUR_MILES hard limit
+                # Prevents selecting stations 20+ miles off the highway, which
+                # burns excessive fuel on detour loops and inflates fuel costs.
+                if detour_miles > MAX_DETOUR_MILES:
+                    continue
+
                 effective_distance = distance_along_route + 2.0 * detour_miles
 
                 # Fuel needed considering detour
@@ -1665,15 +1671,73 @@ class FuelRouteOptimizationEngine:
             elapsed_ms = int((time.time() - start_time) * 1000)
             
             # ✅ CRITICAL (Issue #2 Fix): Recalculate total cost based on ROUNDED gallons
-            # This ensures selected_route.estimated_total_fuel_cost matches sum of stops
-            response_total_cost = Decimal('0')
-            for s in selected_stops:
-                gallons_rounded = Decimal(str(round(s.gallons_to_buy, 1)))
-                price_decimal = s.price_per_gallon if isinstance(s.price_per_gallon, Decimal) else Decimal(str(s.price_per_gallon))
-                stop_cost = price_decimal * gallons_rounded
-                response_total_cost += stop_cost
-            response_total_cost = float(response_total_cost)
-            
+            # This ensures displayed_price × gallons = displayed_cost (cents-accurate)
+            fuel_stops_response = []
+            response_total_cost_decimal = Decimal('0')
+            for i, s in enumerate(selected_stops):
+                price_display = round(float(s.price_per_gallon), 2)
+                gallons_display = round(s.gallons_to_buy, 1)
+                stop_cost = round(price_display * gallons_display, 2)
+                response_total_cost_decimal += Decimal(str(stop_cost))
+                fuel_stops_response.append({
+                    'stop_number': i + 1,
+                    'station_name': s.station_name,
+                    'city': s.city,
+                    'state': s.state,
+                    'address': s.address or '',
+                    'mile_marker': round(s.distance_from_start, 1),
+                    'fuel_price_per_gallon': price_display,
+                    'gallons_to_buy': gallons_display,
+                    'fuel_cost': stop_cost,
+                    'detour_miles': round(s.detour_miles if s.detour_miles is not None else 0.0, 1),
+                    'cost_per_mile': round(s.cost_per_mile if s.cost_per_mile is not None else 0.0, 3),
+                })
+            response_total_cost = float(response_total_cost_decimal)
+
+            # ✅ FIX: When no stations found but route needs fuel, estimate cost from average price
+            # Prevents showing $0 cost for long routes with unavailable station data
+            no_stations_available = not selected_stops and selected_route.distance_miles > VEHICLE_MAX_RANGE
+            if no_stations_available:
+                try:
+                    avg_price = FuelPrice.objects.filter(
+                        version=PriceVersion.objects.filter(is_active=True).first()
+                    ).aggregate(avg_price=Avg('price_per_gallon'))['avg_price']
+                    if avg_price is not None:
+                        avg_price = float(avg_price)
+                    else:
+                        avg_price = 3.45
+                except Exception:
+                    avg_price = 3.45
+                estimated_fuel_cost = round((selected_route.distance_miles / VEHICLE_MPG) * avg_price, 2)
+                logger.warning(
+                    f"[{request_id}] ⚠️  No fuel stations found in corridor for {selected_route.route_id}. "
+                    f"Estimated cost at ${avg_price:.2f}/gal: ${estimated_fuel_cost:.2f}"
+                )
+            else:
+                estimated_fuel_cost = response_total_cost
+
+            # ✅ FIX: Pre-compute fuel accounting for consistency
+            # Uses tank state model so available − consumed = remaining
+            if selected_stops:
+                last_stop_fuel_after = float(selected_stops[-1].fuel_after_refuel)
+                last_stop_dist = selected_stops[-1].distance_from_start
+                last_stop_detour = float(selected_stops[-1].detour_miles if selected_stops[-1].detour_miles is not None else 0.0)
+                final_leg_miles = (selected_route.distance_miles - last_stop_dist) + last_stop_detour
+                fuel_remaining_val = max(0.0, last_stop_fuel_after - final_leg_miles / VEHICLE_MPG)
+            elif no_stations_available:
+                fuel_remaining_val = 0.0  # Stranded without stations
+            else:
+                fuel_remaining_val = max(0.0, float(VEHICLE_TANK) - selected_route.distance_miles / VEHICLE_MPG)
+
+            fuel_purchased_total = sum(round(s.gallons_to_buy, 1) for s in selected_stops)
+            actual_fuel_consumed = VEHICLE_TANK + fuel_purchased_total - fuel_remaining_val
+
+            # Override for no-stations: show what would be needed if stations existed
+            if no_stations_available:
+                ideal_consumption = selected_route.distance_miles / VEHICLE_MPG
+                actual_fuel_consumed = ideal_consumption
+                fuel_purchased_total = ideal_consumption - VEHICLE_TANK  # Implied purchases
+
             # ✅ Log performance metrics
             logger.info(f"[{request_id}] Optimization complete in {elapsed_ms}ms")
             
@@ -1702,22 +1766,30 @@ class FuelRouteOptimizationEngine:
                     'route_id': selected_route.route_id,
                     'distance_miles': round(selected_route.distance_miles, 1),
                     'is_optimal': True,
-                    'reason': 'Lowest cost-per-mile efficiency',
-                    'estimated_total_fuel_consumption_gallons': round(selected_route.distance_miles / VEHICLE_MPG, 1),
-                    'estimated_total_fuel_cost': response_total_cost,  # ✅ Use recalculated cost (Issue #2 fix)
+                    'reason': 'Lowest cost-per-mile efficiency' if not no_stations_available else 'Estimated (no station data available)',
+                    'estimated_total_fuel_consumption_gallons': round(actual_fuel_consumed, 1),
+                    'estimated_total_fuel_cost': estimated_fuel_cost if no_stations_available else response_total_cost,
                     'fuel_stops_required': len(selected_stops),
                     'route_polyline': selected_route.polyline_encoded,
                     'route_map_link': route_map_link,
+                    'warning': 'No fuel stations found in database for this route corridor. Fuel cost is estimated.' if no_stations_available else None,
                 },
                 'route_comparison': [
                     {
                         'route_id': r.route_id,
                         'distance_miles': round(r.distance_miles, 1),
-                        # Recalculate cost based on rounded gallons for consistency
-                        'estimated_total_fuel_cost': float(sum(
-                            s_obj.price_per_gallon * Decimal(str(round(s_obj.gallons_to_buy, 1)))
-                            for s_obj in s
-                        )) if s else 0,
+                        # ✅ FIX: Exact cost matching selected_route for consistency
+                        'estimated_total_fuel_cost': (
+                            response_total_cost
+                            if (s and r.route_id == selected_route.route_id)
+                            else estimated_fuel_cost
+                            if (no_stations_available and r.route_id == selected_route.route_id)
+                            else float(sum(
+                                round(float(s_obj.price_per_gallon), 2) * round(s_obj.gallons_to_buy, 1)
+                                for s_obj in s
+                            )) if s
+                            else 0
+                        ),
                         'fuel_stops_required': len(s),
                         'selected': r.route_id == selected_route.route_id
                     }
@@ -1725,50 +1797,20 @@ class FuelRouteOptimizationEngine:
                 ],
                 # ✅ VALIDATED FUEL STOPS (geometry checked for continuity)
                 # ⚡ PERFORMANCE: Address already cached from FuelStationQueryService (no extra queries)
-                'fuel_stops': [
-                    {
-                        'stop_number': i+1,
-                        'station_name': s.station_name,
-                        'city': s.city,
-                        'state': s.state,
-                        'address': s.address or '',  # Use cached address (avoid N+1 query)
-                        'mile_marker': round(s.distance_from_start, 1),
-                        'fuel_price_per_gallon': float(s.price_per_gallon),
-                        'gallons_to_buy': round(s.gallons_to_buy, 1),
-                        # ✅ Issue #1 Fix: Recalculate cost using rounded gallons to prevent precision error
-                        'fuel_cost': float(s.price_per_gallon * Decimal(str(round(s.gallons_to_buy, 1)))),
-                        # ✅ Additional fields: detour_miles and cost_per_mile (guaranteed to exist in dataclass)
-                        'detour_miles': round(s.detour_miles if s.detour_miles is not None else 0.0, 1),
-                        'cost_per_mile': round(s.cost_per_mile if s.cost_per_mile is not None else 0.0, 3),
-                    }
-                    for i, s in enumerate(selected_stops)
-                ] if selected_stops else [],
+                'fuel_stops': fuel_stops_response,
                 'trip_summary': {
                     'total_distance_miles': round(selected_route.distance_miles, 1),
-                    'total_fuel_consumed_gallons': round(selected_route.distance_miles / VEHICLE_MPG, 1),
-                    'total_fuel_cost': response_total_cost,  # ✅ Use recalculated cost (Issue #2 fix)
-                    # ✅ Issue #1 Fix: Calculate average using rounded gallons
-                    'average_price_per_gallon': float(response_total_cost / sum(round(s.gallons_to_buy, 1) for s in selected_stops)) if selected_stops else 0,
+                    'total_fuel_consumed_gallons': round(actual_fuel_consumed, 1),
+                    'total_fuel_cost': estimated_fuel_cost if no_stations_available else response_total_cost,
+                    'average_price_per_gallon': float(response_total_cost / fuel_purchased_total) if selected_stops else (estimated_fuel_cost / (selected_route.distance_miles / VEHICLE_MPG) if no_stations_available else 0),
                     'total_fuel_stops': len(selected_stops),
-                    
-                    # ✅ ===================================================================
-                    # ✅ COMPLETE FUEL ACCOUNTING FOR ACCURACY VERIFICATION
-                    # ===================================================================
+
+                    # ✅ COMPLETE FUEL ACCOUNTING (self-consistent throughout)
                     'starting_fuel_gallons': VEHICLE_TANK,
-                    'fuel_purchased_at_stops': round(sum(round(s.gallons_to_buy, 1) for s in selected_stops), 1),
-                    'total_fuel_available': round(VEHICLE_TANK + sum(round(s.gallons_to_buy, 1) for s in selected_stops), 1),
-                    'total_fuel_consumed_gallons': round(selected_route.distance_miles / VEHICLE_MPG, 1),
-                    # ✅ FIX: Actual fuel remaining in tank at destination (not cumulative balance)
-                    # Uses last stop's fuel_after_refuel minus final leg consumption
-                    # Previously used VEHICLE_TANK + sum(purchases) - consumption which
-                    # could exceed the 50-gallon tank capacity (e.g., showing 51.9gal)
-                    'fuel_remaining_at_destination': round(
-                        (
-                            (float(selected_stops[-1].fuel_after_refuel) if selected_stops else float(VEHICLE_TANK))
-                            -
-                            (selected_route.distance_miles - (selected_stops[-1].distance_from_start if selected_stops else 0)) / VEHICLE_MPG
-                        ), 1
-                    ),
+                    'fuel_purchased_at_stops': round(fuel_purchased_total, 1),
+                    'total_fuel_available': round(VEHICLE_TANK + fuel_purchased_total, 1),
+                    'total_fuel_consumed_gallons': round(actual_fuel_consumed, 1),
+                    'fuel_remaining_at_destination': round(fuel_remaining_val, 1),
                 }
             }
             

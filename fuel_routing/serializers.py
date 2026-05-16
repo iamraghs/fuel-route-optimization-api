@@ -66,6 +66,7 @@ class SelectedRouteSerializer(serializers.Serializer):
     estimated_total_fuel_cost = serializers.SerializerMethodField()
     fuel_stops_required = serializers.IntegerField()
     route_map_link = serializers.CharField()
+    warning = serializers.CharField(required=False, allow_null=True)
     
     def get_distance_miles(self, obj):
         """Round to 1 decimal place."""
