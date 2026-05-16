@@ -234,10 +234,10 @@ class GeocodingService:
                         'region': 'us',
                         'components': 'country:US'
                     },
-                    timeout=(2, 3)  # (connect_timeout, read_timeout)
+                    timeout=(5, 10)  # (connect_timeout, read_timeout)
                 )
                 response.raise_for_status()
-                
+
                 data = response.json()
                 if data.get('status') != 'OK' or not data.get('results'):
                     raise ValueError(f"Geocoding failed: {data.get('status')}")
@@ -376,9 +376,9 @@ class RoutingService:
                 response = _http_session.get(
                     directions_url,
                     params=params,
-                    timeout=(2, 3)  # (connect_timeout, read_timeout) — fail fast for <1s target
+                    timeout=(5, 10)  # (connect_timeout, read_timeout)
                 )
-                
+
                 logger.info(f"📤 Google API Response Status: {response.status_code}")
                 
                 if response.status_code != 200:
@@ -1697,17 +1697,17 @@ class FuelRouteOptimizationEngine:
             # ✅ FIX: When no stations found but route needs fuel, estimate cost from average price
             # Prevents showing $0 cost for long routes with unavailable station data
             no_stations_available = not selected_stops and selected_route.distance_miles > VEHICLE_MAX_RANGE
-            if no_stations_available:
-                try:
-                    avg_price = FuelPrice.objects.filter(
-                        version=PriceVersion.objects.filter(is_active=True).first()
-                    ).aggregate(avg_price=Avg('price_per_gallon'))['avg_price']
-                    if avg_price is not None:
-                        avg_price = float(avg_price)
-                    else:
-                        avg_price = 3.45
-                except Exception:
+            try:
+                avg_price = FuelPrice.objects.filter(
+                    version=PriceVersion.objects.filter(is_active=True).first()
+                ).aggregate(avg_price=Avg('price_per_gallon'))['avg_price']
+                if avg_price is not None:
+                    avg_price = float(avg_price)
+                else:
                     avg_price = 3.45
+            except Exception:
+                avg_price = 3.45
+            if no_stations_available:
                 estimated_fuel_cost = round((selected_route.distance_miles / VEHICLE_MPG) * avg_price, 2)
                 logger.warning(
                     f"[{request_id}] ⚠️  No fuel stations found in corridor for {selected_route.route_id}. "
@@ -1779,6 +1779,7 @@ class FuelRouteOptimizationEngine:
                         'route_id': r.route_id,
                         'distance_miles': round(r.distance_miles, 1),
                         # ✅ FIX: Exact cost matching selected_route for consistency
+                        # When no stops available for any route, estimate from average price
                         'estimated_total_fuel_cost': (
                             response_total_cost
                             if (s and r.route_id == selected_route.route_id)
@@ -1788,6 +1789,8 @@ class FuelRouteOptimizationEngine:
                                 round(float(s_obj.price_per_gallon), 2) * round(s_obj.gallons_to_buy, 1)
                                 for s_obj in s
                             )) if s
+                            else round((r.distance_miles / VEHICLE_MPG) * avg_price, 2)
+                            if (not s and r.distance_miles > VEHICLE_MAX_RANGE)
                             else 0
                         ),
                         'fuel_stops_required': len(s),
