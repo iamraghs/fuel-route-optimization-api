@@ -6,7 +6,11 @@ state regression, or corridor deviation. Critical for long-distance routes.
 import logging
 import math
 from typing import List, Dict, Tuple, Optional
+
+import polyline
 from geopy.distance import geodesic
+
+from .cache_utils import GeometryCache
 
 
 def _fast_distance_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -20,6 +24,18 @@ def _fast_distance_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> 
     return R * c
 
 logger = logging.getLogger(__name__)
+
+
+def decode_route_to_coordinates(polyline_encoded: str) -> List[Tuple[float, float]]:
+    """Decode Google encoded polyline to lat/lon coordinates. Uses GeometryCache."""
+    if not polyline_encoded:
+        return []
+    # Check geometry cache — stores (coords, cum_dist, sampled_coords, sampled_cum_dist)
+    cached = GeometryCache.get(polyline_encoded)
+    if cached is not None:
+        return cached[0]  # coords
+    return polyline.decode(polyline_encoded)
+
 
 class RouteGeometryValidator:
     """Validates fuel stop sequencing and route continuity."""

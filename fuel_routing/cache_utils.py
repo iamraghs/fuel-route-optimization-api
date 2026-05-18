@@ -1,30 +1,137 @@
 """
-Production-Grade Cache Utilities with Request Coalescing and Normalization.
+Production-Grade Cache Utilities with Request Coalescing, Geometry Caching, and Corridor Caching.
 
-Enhancements over base cache.py:
+Enhancements:
   • Unified route normalization (addresses + coordinates)
   • Distributed request locking to prevent duplicate computation
   • Request coalescing for concurrent identical requests
   • Standardized cache key generation
   • Atomic cache operations
+  • Geometry cache: in-process LRU for decoded polylines + cumulative distances
+  • Corridor station cache: Redis-backed filtered station ID sets per route
   • Proper error handling with fallbacks
 """
 
 import hashlib
 import logging
+import threading
 import time
-from typing import Optional, Dict, Any, Callable, TypeVar
-from decimal import Decimal
-from datetime import datetime, timedelta
-from functools import wraps
-from threading import Lock
+from collections import OrderedDict
+from typing import Optional, Dict, Any, Callable, TypeVar, List, Tuple
 
 from django.core.cache import cache
-from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar('T')
+
+
+# ============================================================================
+# GEOMETRY CACHE (in-process LRU for decoded polyline + cumulative distances)
+# ============================================================================
+
+class GeometryCache:
+    """In-process LRU cache for decoded polyline coordinates and cumulative distances.
+
+    Avoids repeated polyline decode and cumulative distance computation.
+    Bounded at MAX_SIZE entries. Thread-safe for CPython (GIL protects dict ops).
+    """
+    _cache: OrderedDict = OrderedDict()
+    MAX_SIZE = 200
+
+    @classmethod
+    def make_key(cls, polyline_encoded: str) -> str:
+        """Generate deterministic key from encoded polyline."""
+        return hashlib.md5(polyline_encoded.encode()).hexdigest()
+
+    @classmethod
+    def get(cls, polyline_encoded: str) -> Optional[Tuple[List[Tuple[float, float]], List[float], List[Tuple[float, float]], List[float]]]:
+        """Get cached geometry data. Returns None if not cached."""
+        key = cls.make_key(polyline_encoded)
+        if key in cls._cache:
+            cls._cache.move_to_end(key)
+            return cls._cache[key]
+        return None
+
+    @classmethod
+    def set(cls, polyline_encoded: str, coords: List[Tuple[float, float]], cum_dist: List[float],
+            sampled_coords: List[Tuple[float, float]], sampled_cum_dist: List[float]):
+        """Store geometry data in cache. Evicts oldest if over MAX_SIZE."""
+        if not polyline_encoded:
+            return
+        key = cls.make_key(polyline_encoded)
+        cls._cache[key] = (coords, cum_dist, sampled_coords, sampled_cum_dist)
+        cls._cache.move_to_end(key)
+        if len(cls._cache) > cls.MAX_SIZE:
+            cls._cache.popitem(last=False)
+
+    @classmethod
+    def clear(cls):
+        """Clear all cached geometry."""
+        cls._cache.clear()
+
+    @classmethod
+    def size(cls) -> int:
+        return len(cls._cache)
+
+
+# ============================================================================
+# CORRIDOR STATION CACHE (Redis-backed filtered station sets per route)
+# ============================================================================
+
+CORRIDOR_CACHE_PREFIX = "fuel_routing:corridor:v1"
+CORRIDOR_CACHE_TTL = 3600  # 1 hour (station sets stable; price changes don't affect which stations exist)
+
+
+class CorridorStationCache:
+    """Redis-backed cache for corridor-filtered station ID sets per route.
+
+    Avoids repeated polyline-based corridor filtering for the same route.
+    Stores only OPIS IDs (not full station data), so price changes don't invalidate.
+    """
+
+    @staticmethod
+    def _make_key(route_id: str, buffer_miles: float) -> str:
+        return f"{CORRIDOR_CACHE_PREFIX}:{route_id}:buf{int(buffer_miles)}"
+
+    @staticmethod
+    def get(route_id: str, buffer_miles: float) -> Optional[List[int]]:
+        """Get cached station OPIS IDs for a route corridor."""
+        key = CorridorStationCache._make_key(route_id, buffer_miles)
+        try:
+            result = cache.get(key)
+            if result is not None:
+                logger.debug(f"Corridor cache HIT: {key}")
+                return result
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def set(route_id: str, buffer_miles: float, opis_ids: List[int]):
+        """Cache station OPIS IDs for a route corridor."""
+        if not opis_ids:
+            return
+        key = CorridorStationCache._make_key(route_id, buffer_miles)
+        try:
+            cache.set(key, opis_ids, CORRIDOR_CACHE_TTL)
+            logger.debug(f"Cached {len(opis_ids)} corridor station IDs: {key}")
+        except Exception as e:
+            logger.warning(f"Failed to cache corridor stations: {e}")
+
+    @staticmethod
+    def get_or_compute(
+        route_id: str,
+        buffer_miles: float,
+        compute_fn: Callable[[], List[int]]
+    ) -> List[int]:
+        """Get cached corridor station IDs or compute and cache."""
+        cached = CorridorStationCache.get(route_id, buffer_miles)
+        if cached is not None:
+            return cached
+        opis_ids = compute_fn()
+        CorridorStationCache.set(route_id, buffer_miles, opis_ids)
+        return opis_ids
 
 
 # ============================================================================
@@ -106,14 +213,6 @@ class EnhancedCacheKeyGenerator:
         return f"{cls.PREFIX}:route:{cls.VERSION}:{hash_val}"
     
     @classmethod
-    def optimization_key(cls, start_lat: float, start_lon: float, end_lat: float, end_lon: float, price_version: int = 0) -> str:
-        """Cache key for optimization result (price-aware)."""
-        start_norm = RouteNormalizer.normalize_coordinates(start_lat, start_lon)
-        end_norm = RouteNormalizer.normalize_coordinates(end_lat, end_lon)
-        hash_val = cls._make_hash(*start_norm, *end_norm, price_version)
-        return f"{cls.PREFIX}:optimization:{cls.VERSION}:{hash_val}"
-    
-    @classmethod
     def lock_key(cls, cache_key: str) -> str:
         """Generate a lock key for preventing duplicate computation."""
         return f"{cache_key}:lock"
@@ -137,7 +236,7 @@ class RequestLockManager:
         
         Returns True if lock acquired, False if already locked.
         """
-        lock_value = f"{time.time()}:{id(Lock())}"
+        lock_value = f"{time.time()}:{threading.get_ident()}"
         result = cache.add(lock_key, lock_value, timeout)
         return result
     
@@ -276,81 +375,3 @@ class AtomicCacheOps:
             cache.set(cache_key, result, ttl)
             return result
 
-
-# ============================================================================
-# CACHE DECORATORS
-# ============================================================================
-
-def cached(ttl: int = 3600, key_fn: Optional[Callable] = None):
-    """
-    Decorator to cache function results.
-    
-    Usage:
-        @cached(ttl=3600, key_fn=lambda start, end: f"optimize:{start}:{end}")
-        def expensive_function(start, end):
-            return result
-    """
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        @wraps(func)
-        def wrapper(*args, **kwargs) -> T:
-            # Generate cache key
-            if key_fn:
-                cache_key = key_fn(*args, **kwargs)
-            else:
-                # Default: use function name + args hash
-                args_str = "|".join(str(arg) for arg in args)
-                kwargs_str = "|".join(f"{k}:{v}" for k, v in sorted(kwargs.items()))
-                combined = f"{func.__name__}:{args_str}:{kwargs_str}"
-                cache_key = hashlib.md5(combined.encode()).hexdigest()
-            
-            # Try to get from cache
-            result = cache.get(cache_key)
-            if result is not None:
-                logger.debug(f"Cache HIT: {func.__name__}")
-                return result
-            
-            # Compute and cache
-            result = func(*args, **kwargs)
-            cache.set(cache_key, result, ttl)
-            return result
-        
-        return wrapper
-    
-    return decorator
-
-
-# ============================================================================
-# VERSION MANAGEMENT (for price-aware caching)
-# ============================================================================
-
-class CacheVersionManager:
-    """Manage cache versioning for price updates."""
-    
-    PRICE_VERSION_KEY = "price:version"
-    
-    @classmethod
-    def get_price_version(cls) -> int:
-        """Get current price version."""
-        version = cache.get(cls.PRICE_VERSION_KEY, 0)
-        return version
-    
-    @classmethod
-    def increment_price_version(cls):
-        """Increment price version (invalidates price-aware caches)."""
-        current = cls.get_price_version()
-        cache.set(cls.PRICE_VERSION_KEY, current + 1, None)  # None = persist forever
-        logger.info(f"Price version incremented to {current + 1}")
-    
-    @classmethod
-    def get_optimization_key_with_version(
-        cls,
-        start_lat: float,
-        start_lon: float,
-        end_lat: float,
-        end_lon: float
-    ) -> str:
-        """Get optimization cache key with current price version."""
-        price_version = cls.get_price_version()
-        return EnhancedCacheKeyGenerator.optimization_key(
-            start_lat, start_lon, end_lat, end_lon, price_version
-        )
