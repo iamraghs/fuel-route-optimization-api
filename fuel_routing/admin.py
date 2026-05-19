@@ -3,7 +3,7 @@ from django.contrib import admin
 from django.utils.html import format_html
 from .models import (
     FuelStation, FuelPrice, PriceVersion, RouteCache,
-    OptimizationCache, RouteRequest, GeocodeFailure
+    RouteRequest, GeocodeFailure
 )
 
 
@@ -356,58 +356,6 @@ class RouteCacheAdmin(admin.ModelAdmin):
     distance_display.short_description = "Distance"
 
 
-@admin.register(OptimizationCache)
-class OptimizationCacheAdmin(admin.ModelAdmin):
-    """Admin interface for Optimization Caches."""
-    
-    list_display = (
-        'cache_key_display', 'fuel_stops_count',
-        'total_fuel_cost_display', 'created_at'
-    )
-    
-    list_filter = ('is_valid', 'created_at', 'expires_at')
-    readonly_fields = ('cache_key', 'created_at')
-    
-    fieldsets = (
-        ('Cache Info', {
-            'fields': ('cache_key', 'route_cache', 'version')
-        }),
-        ('Optimization Result', {
-            'fields': (
-                'total_distance_miles',
-                'total_fuel_needed',
-                'total_fuel_cost',
-                'fuel_stop_count'
-            )
-        }),
-        ('Status', {
-            'fields': ('is_valid', 'api_calls_saved')
-        }),
-        ('Timestamps', {
-            'fields': ('created_at', 'expires_at'),
-            'classes': ('collapse',)
-        }),
-    )
-    
-    def cache_key_display(self, obj):
-        """Cache key display (truncated)."""
-        return obj.cache_key[:30] + "..."
-    
-    cache_key_display.short_description = "Cache Key"
-    
-    def fuel_stops_count(self, obj):
-        """Number of fuel stops."""
-        return obj.fuel_stop_count
-    
-    fuel_stops_count.short_description = "Stops"
-    
-    def total_fuel_cost_display(self, obj):
-        """Total cost display."""
-        return f"${float(obj.total_fuel_cost):.2f}"
-    
-    total_fuel_cost_display.short_description = "Total Cost"
-
-
 @admin.register(RouteRequest)
 class RouteRequestAdmin(admin.ModelAdmin):
     """Admin interface for Route Requests (audit log)."""
@@ -500,7 +448,7 @@ class GeocodeFailureAdmin(admin.ModelAdmin):
     
     def failure_status(self, obj):
         """Visual failure status."""
-        if obj.resolution == 'fixed':
+        if obj.is_resolved:
             return format_html(
                 '<span style="color: #0d7300;">✓ FIXED</span>'
             )

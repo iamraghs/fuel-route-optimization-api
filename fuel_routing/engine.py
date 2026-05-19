@@ -2,6 +2,7 @@
 import hashlib
 import logging
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
@@ -80,6 +81,23 @@ def _get_active_price_version() -> int:
 def _get_avg_price_for_version(price_version_id: int) -> float:
     """Get average fuel price using in-process cache."""
     return get_cached_avg_price(price_version_id)
+
+
+def _build_map_link(start_input, end_input, start_loc, end_loc) -> str:
+    """Build Google Maps URL using formatted address when available, else coordinates."""
+    def _encode(val):
+        if isinstance(val, str):
+            return urllib.parse.quote(val)
+        return None
+
+    origin = _encode(start_input) if isinstance(start_input, str) else None
+    dest = _encode(end_input) if isinstance(end_input, str) else None
+    if origin and dest:
+        return f"https://www.google.com/maps/dir/{origin}/{dest}"
+
+    start_coords = f"{start_loc.latitude},{start_loc.longitude}"
+    end_coords = f"{end_loc.latitude},{end_loc.longitude}"
+    return f"https://www.google.com/maps/dir/{start_coords}/{end_coords}"
 
 
 class FuelRouteOptimizationEngine:
@@ -183,7 +201,7 @@ class FuelRouteOptimizationEngine:
             primary_route = routes[0]
             if primary_route.distance_miles <= VEHICLE_MAX_RANGE:
                 result = FuelRouteOptimizationEngine._short_route_path(
-                    routes, start_loc, end_loc,
+                    routes, start_input, end_input, start_loc, end_loc,
                     start_city, start_state, start_formatted,
                     end_city, end_state, end_formatted,
                     request_id, start_time
@@ -208,6 +226,7 @@ class FuelRouteOptimizationEngine:
     @staticmethod
     def _short_route_path(
         routes: List['RouteAlternative'],
+        start_input, end_input,
         start_loc: Location, end_loc: Location,
         start_city: str, start_state: str, start_formatted: str,
         end_city: str, end_state: str, end_formatted: str,
@@ -220,9 +239,7 @@ class FuelRouteOptimizationEngine:
         best_route = min(routes, key=lambda r: r.distance_miles)
         elapsed_ms = int((time.time() - start_time) * 1000)
 
-        start_coords = f"{start_loc.latitude},{start_loc.longitude}"
-        end_coords = f"{end_loc.latitude},{end_loc.longitude}"
-        route_map_link = f"https://www.google.com/maps/dir/{start_coords}/{end_coords}"
+        route_map_link = _build_map_link(start_input, end_input, start_loc, end_loc)
 
         estimated_fuel = best_route.distance_miles / VEHICLE_MPG
         estimated_cost = estimated_fuel * avg_price_per_gal
@@ -598,16 +615,15 @@ class FuelRouteOptimizationEngine:
         )
 
         # For infeasible routes (no stations, distance > max range),
-        # fuel_purchased_total stays 0 (matches empty fuel_stops) and
-        # actual_fuel_consumed is naturally limited to available fuel.
-        # The route_feasible: false flag signals the infeasibility.
+        # report distance-based fuel consumption (not tank-constrained)
+        # and show the deficit as negative remaining — the negative value
+        # communicates "you'd run out X gallons before finishing."
         if no_stations_available:
-            pass
+            actual_fuel_consumed = selected_route.distance_miles / VEHICLE_MPG
+            fuel_remaining_val = VEHICLE_TANK - actual_fuel_consumed
 
         # Generate Google Maps navigation link
-        start_coords = f"{start_loc.latitude},{start_loc.longitude}"
-        end_coords = f"{end_loc.latitude},{end_loc.longitude}"
-        route_map_link = f"https://www.google.com/maps/dir/{start_coords}/{end_coords}"
+        route_map_link = _build_map_link(start_input, end_input, start_loc, end_loc)
 
         response = {
             '_cache_hit': False,

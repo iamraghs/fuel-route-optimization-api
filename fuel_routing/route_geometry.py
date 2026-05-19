@@ -8,7 +8,6 @@ import math
 from typing import List, Dict, Tuple, Optional
 
 import polyline
-from geopy.distance import geodesic
 
 from .cache_utils import GeometryCache
 

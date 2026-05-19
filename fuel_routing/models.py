@@ -13,9 +13,8 @@ Tables:
   2. FuelPrice - Dynamic, versioned, append-only
   3. PriceVersion - Atomic version control
   4. RouteCache - Google Routes API response cache
-  5. OptimizationCache - Computed optimization results
-  6. RouteRequest - Immutable audit log
-  7. GeocodeFailure - Retry queue
+  5. RouteRequest - Immutable audit log
+  6. GeocodeFailure - Retry queue
 
 Performance Focus:
   • Spatial queries: GIST PostGIS indexes
@@ -32,8 +31,7 @@ from django.contrib.postgres.indexes import GistIndex
 from django.core.validators import MinValueValidator, MaxValueValidator
 from django.utils import timezone
 from decimal import Decimal
-import hashlib
-import json
+
 
 
 
@@ -640,160 +638,6 @@ class RouteCache(models.Model):
     
     def __str__(self):
         return f"Route: {self.start_address[:30]} → {self.end_address[:30]}"
-
-
-# ============================================================================
-# TABLE 5: OptimizationCache (COMPUTED RESULTS, VERSION-BOUND)
-# ============================================================================
-
-class OptimizationCache(models.Model):
-    """
-    Caches computed fuel stop optimization results.
-    
-    PERFORMANCE CHARACTERISTICS:
-      • Fastest possible response (<5ms lookup)
-      • Bound to price version (auto-invalidated)
-      • Contains complete optimization result
-      • Stored in Redis + PostgreSQL
-      • <2ms direct key lookup
-    
-    DESIGN:
-      • Immutable after creation
-      • Versioned (tied to PriceVersion)
-      • JSONB for flexible fuel stop storage
-      • Auto-invalidated on price version change
-      • Partitioned by version_id
-    
-    QUERY PATTERNS:
-      • Direct cache_key lookup (fastest)
-      • Route + version lookup (fallback)
-      • Cleanup expired optimizations
-    """
-    
-    # CACHE IDENTIFICATION
-    cache_key = models.CharField(
-        max_length=128,
-        unique=True,
-        db_index=True,
-        help_text="Unique cache key (route_hash + version)"
-    )
-    
-    # ROUTE + VERSION
-    route_cache = models.ForeignKey(
-        'RouteCache',
-        on_delete=models.CASCADE,
-        db_index=True,
-        help_text="Associated route"
-    )
-    version = models.ForeignKey(
-        'PriceVersion',
-        on_delete=models.PROTECT,
-        db_index=True,
-        help_text="Price version (for invalidation)"
-    )
-    
-    # OPTIMIZATION RESULT
-    total_distance_miles = models.FloatField(
-        help_text="Total route distance"
-    )
-    total_fuel_needed = models.FloatField(
-        validators=[MinValueValidator(0.1)],
-        help_text="Gallons of fuel needed"
-    )
-    total_fuel_cost = models.DecimalField(
-        max_digits=10,
-        decimal_places=2,
-        validators=[MinValueValidator(0.01)],
-        help_text="Total fuel cost in USD"
-    )
-    fuel_stop_count = models.SmallIntegerField(
-        validators=[MinValueValidator(1), MaxValueValidator(10)],
-        help_text="Number of fuel stops (1-10)"
-    )
-    fuel_stops_json = models.JSONField(
-        help_text="""Detailed fuel stops array:
-        [
-          {
-            "opis_id": 9,
-            "name": "KWIK TRIP #796",
-            "city": "Tomah",
-            "state": "WI",
-            "latitude": 43.95,
-            "longitude": -90.52,
-            "price_per_gallon": 3.287,
-            "distance_from_start": 125.3,
-            "distance_to_next_stop": 98.5,
-            "gallons_needed": 12.5,
-            "cost": 41.09,
-            "detour_miles": 5.2
-          },
-          ...
-        ]"""
-    )
-    
-    # OPERATIONAL
-    computation_time_ms = models.IntegerField(
-        help_text="Time to compute optimization (ms)"
-    )
-    api_calls_saved = models.SmallIntegerField(
-        default=1,
-        help_text="Number of API calls saved by cache"
-    )
-    is_valid = models.BooleanField(
-        default=True,
-        db_index=True,
-        help_text="Optimization is valid"
-    )
-    
-    # TEMPORAL
-    created_at = models.DateTimeField(
-        auto_now_add=True,
-        help_text="When optimization was computed"
-    )
-    expires_at = models.DateTimeField(
-        db_index=True,
-        help_text="When cache expires"
-    )
-    
-    class Meta:
-        indexes = [
-            # Primary lookup (fastest)
-            models.Index(
-                fields=['cache_key'],
-                name='idx_opt_cache_key'
-            ),
-            # Route + version lookup
-            models.Index(
-                fields=['route_cache', 'version'],
-                name='idx_opt_route_ver',
-                condition=models.Q(is_valid=True)
-            ),
-            # Expiration cleanup
-            models.Index(
-                fields=['expires_at'],
-                name='idx_opt_expires',
-                condition=models.Q(is_valid=True)
-            ),
-            # Cost analysis
-            models.Index(
-                fields=['total_fuel_cost'],
-                name='idx_opt_cost',
-                condition=models.Q(is_valid=True)
-            ),
-        ]
-        
-        # Partition by version_id
-        # partition_by_fields = ['version_id']
-        
-        verbose_name_plural = "Optimization Caches"
-        ordering = ['-created_at']
-    
-    def __str__(self):
-        return f"Optimization: {self.fuel_stop_count} stops, ${self.total_fuel_cost:.2f} (v{self.version.version_number})"
-    
-    def get_fuel_stops(self):
-        """Parse fuel stops from JSON."""
-        return json.loads(self.fuel_stops_json) if isinstance(self.fuel_stops_json, str) else self.fuel_stops_json
 
 
 # ============================================================================

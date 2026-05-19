@@ -1,6 +1,5 @@
 """Fuel optimization engine implementing Greedy + Lookahead algorithm."""
 import logging
-import math
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,7 +14,6 @@ from .constants import (
 )
 from .geocoding import Location, _fast_distance_miles
 from .models import FuelPrice, PriceVersion
-from .route_geometry import decode_route_to_coordinates
 from .routing import RouteAlternative
 from .cache_utils import GeometryCache
 
