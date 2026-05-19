@@ -38,6 +38,26 @@ class GeometryCache:
     """
     _cache: OrderedDict = OrderedDict()
     MAX_SIZE = 200
+    _check_counter: int = 0
+    _redis_version: Optional[str] = None
+    _GEOMETRY_VERSION_KEY = "fuel_routing:geometry:cache_version"
+    _CHECK_INTERVAL = 10  # Check Redis every N gets to detect cross-worker invalidation
+
+    @classmethod
+    def _check_redis_version(cls):
+        """Check if Redis-stored geometry version changed; clear cache if so."""
+        cls._check_counter += 1
+        if cls._check_counter % cls._CHECK_INTERVAL != 0:
+            return
+        try:
+            current = cache.get(cls._GEOMETRY_VERSION_KEY)
+            if current is not None and current != cls._redis_version:
+                cls._cache.clear()
+                cls._redis_version = current
+            elif cls._redis_version is None and current is not None:
+                cls._redis_version = current
+        except Exception:
+            pass  # Redis unavailable — fall through
 
     @classmethod
     def make_key(cls, polyline_encoded: str) -> str:
@@ -47,6 +67,7 @@ class GeometryCache:
     @classmethod
     def get(cls, polyline_encoded: str) -> Optional[Tuple[List[Tuple[float, float]], List[float], List[Tuple[float, float]], List[float]]]:
         """Get cached geometry data. Returns None if not cached."""
+        cls._check_redis_version()
         key = cls.make_key(polyline_encoded)
         if key in cls._cache:
             cls._cache.move_to_end(key)

@@ -9,7 +9,10 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from django.conf import settings
+from django.contrib.gis.geos import LineString
+from django.contrib.gis.measure import D
 from django.core.cache import cache
+from django.db import transaction
 from django.db.models import Avg
 from django.utils import timezone
 
@@ -21,6 +24,7 @@ from .cache_service import get_cached_optimization, set_cached_optimization
 from .constants import (
     GOOGLE_API_KEY, VEHICLE_MAX_RANGE, VEHICLE_MPG, VEHICLE_TANK,
     LOOKAHEAD_MILES, MAX_DETOUR_MILES, MIN_DESTINATION_RESERVE_GALLONS,
+    CORRIDOR_BUFFER_MILES,
 )
 from .geocoding import GeocodingService, Location
 from .models import FuelPrice, FuelStation, PriceVersion
@@ -43,23 +47,29 @@ _PRICE_VERSION_CACHE_TTL = 30  # seconds
 # Module-level ThreadPoolExecutor for parallel geocoding (reused across requests)
 _geocode_executor = ThreadPoolExecutor(max_workers=2)
 
-# In-process location resolution cache: {normalized_address: Location}
-_location_cache: Dict[str, Any] = {}
-_LOCATION_CACHE_TTL = 300  # 5 minutes
-
 # Lightweight cache-hit counters for observability
 _cache_hit_counters: Dict[str, int] = {}
+_request_counter: int = 0
+_STATS_LOG_INTERVAL = 100  # Log aggregate stats every N requests
 
 
 def _get_active_price_version() -> int:
-    """Get current active price version ID with in-process caching."""
+    """Get current active price version ID with in-process caching + Redis sync."""
     now = time.time()
     if (_active_price_version_cache['cached_at'] + _PRICE_VERSION_CACHE_TTL) > now:
         return _active_price_version_cache['version_id']
 
     try:
+        # Check Redis first for cross-worker consistency
+        redis_version = cache.get('price_version:active')
+        if redis_version is not None:
+            _active_price_version_cache['version_id'] = redis_version
+            _active_price_version_cache['cached_at'] = now
+            return redis_version
+
         pv = PriceVersion.objects.filter(is_active=True).values_list('id', flat=True).first()
         version_id = pv or 0
+        cache.set('price_version:active', version_id, 60)  # Sync to other workers
         _active_price_version_cache['version_id'] = version_id
         _active_price_version_cache['cached_at'] = now
         return version_id
@@ -126,9 +136,16 @@ class FuelRouteOptimizationEngine:
                 cached_result.setdefault('route_feasible', True)
                 cached_result.setdefault('optimization_confidence', 'cached')
                 _cache_hit_counters['optimization'] = _cache_hit_counters.get('optimization', 0) + 1
+                global _request_counter
+                _request_counter += 1
                 logger.info(
                     f"[{request_id}] Optimization cache HIT in {elapsed_ms}ms"
                 )
+                if _request_counter % _STATS_LOG_INTERVAL == 0:
+                    logger.info(
+                        f"[STATS] requests={_request_counter} "
+                        f"cache_hits={_cache_hit_counters.get('optimization', 0)}"
+                    )
                 return cached_result
 
             # Validate API key
@@ -333,50 +350,109 @@ class FuelRouteOptimizationEngine:
             merged_lon_min = min(start_loc.longitude, end_loc.longitude)
             merged_lon_max = max(start_loc.longitude, end_loc.longitude)
 
-        # Query stations using merged bounding box
         opis_ids_with_prices = list(all_prices.keys())
         all_route_stations = []
-        try:
-            candidate_stations = FuelStation.objects.filter(
-                is_active=True,
-                opis_id__in=opis_ids_with_prices,
-                latitude__gte=merged_lat_min - 3.0,
-                latitude__lte=merged_lat_max + 3.0,
-                longitude__gte=merged_lon_min - 3.0,
-                longitude__lte=merged_lon_max + 3.0
-            ).values(
-                'opis_id', 'name', 'address', 'city', 'state', 'latitude', 'longitude'
-            ).iterator()
 
-            for station in candidate_stations:
-                price = all_prices.get(station['opis_id'])
-                if price and price > 0:
-                    all_route_stations.append({
-                        'opis_id': station['opis_id'],
-                        'name': station['name'],
-                        'address': station.get('address', ''),
-                        'city': station['city'],
-                        'state': station['state'],
-                        'latitude': float(station['latitude']),
-                        'longitude': float(station['longitude']),
-                        'price_per_gallon': price,
-                    })
+        # OPTIMIZED: Per-route PostGIS corridor query with automatic fallback
+        def _load_route_stations(route):
+            """Load stations for a route using PostGIS corridor query (with fallback)."""
+            cached_ids = CorridorStationCache.get(route.route_id, CORRIDOR_BUFFER_MILES)
+            if cached_ids is not None:
+                db_stations = FuelStation.objects.filter(
+                    opis_id__in=list(cached_ids), is_active=True
+                ).values(
+                    'opis_id', 'name', 'address', 'city', 'state', 'latitude', 'longitude'
+                )
+                result = []
+                for s in db_stations:
+                    price = all_prices.get(s['opis_id'])
+                    if price and price > 0:
+                        s['price_per_gallon'] = price
+                        s['latitude'] = float(s['latitude'])
+                        s['longitude'] = float(s['longitude'])
+                        result.append(s)
+                return result
 
-            logger.info(
-                f"[{request_id}] Found {len(all_route_stations)} stations with valid prices"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to load merged station set: {e}")
-            all_route_stations = []
+            if route.polyline_encoded:
+                try:
+                    all_coords, _, _, _ = FuelOptimizer.precompute_route_distances(
+                        route.polyline_encoded
+                    )
+                    if all_coords:
+                        route_line = LineString(
+                            [(float(lon), float(lat)) for lat, lon in all_coords], srid=4326
+                        )
+                        with transaction.atomic():
+                            qs = FuelStation.objects.filter(
+                                is_active=True,
+                                opis_id__in=opis_ids_with_prices,
+                                location_point__dwithin=(route_line, D(mi=CORRIDOR_BUFFER_MILES)),
+                            ).values(
+                                'opis_id', 'name', 'address', 'city', 'state', 'latitude', 'longitude'
+                            )
+                            result = []
+                            for s in qs.iterator():
+                                price = all_prices.get(s['opis_id'])
+                                if price and price > 0:
+                                    s['price_per_gallon'] = price
+                                    s['latitude'] = float(s['latitude'])
+                                    s['longitude'] = float(s['longitude'])
+                                    result.append(s)
+                        CorridorStationCache.set(
+                            route.route_id, CORRIDOR_BUFFER_MILES,
+                            [s['opis_id'] for s in result]
+                        )
+                        return result
+                except Exception:
+                    logger.warning(
+                        f"[{request_id}] PostGIS corridor query failed for {route.route_id}, "
+                        f"falling back to bbox+Python filter"
+                    )
 
-        # Optimize each route
+            # Fallback: load full bbox once, then Python-filter per route
+            nonlocal all_route_stations
+            if not all_route_stations:
+                try:
+                    all_lats, all_lons = [], []
+                    for r in routes:
+                        bounds = r.bounds if isinstance(r.bounds, dict) else {}
+                        sw, ne = bounds.get('sw', {}), bounds.get('ne', {})
+                        slat = sw.get('lat') or sw.get('latitude')
+                        slon = sw.get('lng') or sw.get('longitude')
+                        nelat = ne.get('lat') or ne.get('latitude')
+                        nelon = ne.get('lng') or ne.get('longitude')
+                        if all(v is not None for v in [slat, slon, nelat, nelon]):
+                            all_lats.extend([slat, nelat])
+                            all_lons.extend([slon, nelon])
+                    if all_lats and all_lons:
+                        lat_min, lat_max = min(all_lats), max(all_lats)
+                        lon_min, lon_max = min(all_lons), max(all_lons)
+                        for st in FuelStation.objects.filter(
+                            is_active=True, opis_id__in=opis_ids_with_prices,
+                            latitude__gte=lat_min - 3.0, latitude__lte=lat_max + 3.0,
+                            longitude__gte=lon_min - 3.0, longitude__lte=lon_max + 3.0,
+                        ).values(
+                            'opis_id', 'name', 'address', 'city', 'state', 'latitude', 'longitude'
+                        ).iterator():
+                            price = all_prices.get(st['opis_id'])
+                            if price and price > 0:
+                                st['price_per_gallon'] = price
+                                st['latitude'] = float(st['latitude'])
+                                st['longitude'] = float(st['longitude'])
+                                all_route_stations.append(dict(st))
+                except Exception as e:
+                    logger.warning(f"[{request_id}] Bbox station query failed: {e}")
+
+            return FuelStationQueryService.filter_stations_by_route(
+                route, all_route_stations
+            ) if all_route_stations else []
+
+        # Optimize each route using per-route corridor query
         route_optimizations = []
         for route_idx, route in enumerate(routes):
             logger.info(f"[{request_id}] === Processing {route.route_id} ===")
 
-            route_stations = FuelStationQueryService.filter_stations_by_route(
-                route, all_route_stations
-            )
+            route_stations = _load_route_stations(route)
             logger.info(
                 f"[{request_id}] Found {len(route_stations)} stations in corridor"
             )

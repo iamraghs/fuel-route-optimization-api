@@ -48,11 +48,14 @@ class FuelStopDetail:
 
 # In-process cache: {price_version_id: avg_price}
 _avg_price_cache: Dict[int, float] = {}
+_AVG_PRICE_CACHE_MAX = 10  # prevent unbounded growth (only 1-2 expected)
 
 
 def get_cached_avg_price(price_version_id: int, force: bool = False) -> float:
     """Get average fuel price, cached in-process per version ID."""
-    if force or price_version_id not in _avg_price_cache:
+    if force:
+        _avg_price_cache.pop(price_version_id, None)
+    if price_version_id not in _avg_price_cache:
         try:
             avg = FuelPrice.objects.filter(
                 version_id=price_version_id
@@ -60,6 +63,9 @@ def get_cached_avg_price(price_version_id: int, force: bool = False) -> float:
             _avg_price_cache[price_version_id] = float(avg) if avg else 3.45
         except Exception:
             _avg_price_cache[price_version_id] = 3.45
+    # Trim if over max size (evict oldest — dict preserves insertion order in 3.7+)
+    while len(_avg_price_cache) > _AVG_PRICE_CACHE_MAX:
+        _avg_price_cache.pop(next(iter(_avg_price_cache)))
     return _avg_price_cache[price_version_id]
 
 

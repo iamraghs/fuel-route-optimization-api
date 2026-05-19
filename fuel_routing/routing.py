@@ -7,14 +7,14 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from django.conf import settings
 from django.contrib.gis.geos import LineString
+from django.db.models import F
 from django.utils import timezone
 
 import polyline
 
 from .cache_utils import EnhancedCacheKeyGenerator, RequestLockManager
-from .constants import GOOGLE_API_KEY, GOOGLE_ROUTES_ENDPOINT
+from .constants import GOOGLE_API_KEY, GOOGLE_ROUTES_ENDPOINT, CACHE_TTL_ROUTE
 from .geocoding import Location
 from .models import RouteCache
 
@@ -150,7 +150,7 @@ class RoutingService:
             lock_key=lock_key,
             result_key=cache_key,
             compute_fn=compute_routes,
-            cache_ttl=settings.CACHE_TTL['ROUTE_GEOMETRY']
+            cache_ttl=CACHE_TTL_ROUTE
         )
 
         return result if isinstance(result, list) else []
@@ -169,6 +169,13 @@ class RoutingService:
             ).first()
 
             if single:
+                # Lightweight access tracking (best-effort, single query)
+                try:
+                    RouteCache.objects.filter(
+                        cache_key=base_key, is_valid=True
+                    ).update(access_count=models.F('access_count') + 1)
+                except Exception:
+                    pass
                 return [
                     RouteAlternative(
                         route_id='route_a',
@@ -223,8 +230,7 @@ class RoutingService:
                     route_key = f"{base_key}:alt_{i}"
 
                 decoded_coords = polyline.decode(route.polyline_encoded)
-                RouteCache.objects.create(
-                    cache_key=route_key,
+                defaults = dict(
                     start_address=f"{route.bounds['sw']['lat']:.6f}, {route.bounds['sw']['lng']:.6f}",
                     end_address=f"{route.bounds['ne']['lat']:.6f}, {route.bounds['ne']['lng']:.6f}",
                     start_lat=route.bounds['sw']['lat'],
@@ -239,7 +245,11 @@ class RoutingService:
                     google_api_cost=Decimal('0.01'),
                     expires_at=expiry,
                     is_valid=True,
-                    computation_time_ms=0
+                    computation_time_ms=0,
+                )
+                RouteCache.objects.update_or_create(
+                    cache_key=route_key,
+                    defaults=defaults,
                 )
 
             logger.info(f"Cached {len(routes)} route(s) for 24 hours")

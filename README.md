@@ -59,14 +59,16 @@ api.py → engine.py → cache_service.py → cache_utils.py (Redis locks, key g
 |----------|--------|-----------|
 | Algorithm | Greedy + 200mi Lookahead | O(n log n) vs DP O(n²); within 2-3% of optimal |
 | Route alternatives | 2 (not 3+) | Diminishing returns beyond 2; avoids excess Google API cost |
-| Distance calc | Haversine (Python) | ~0.5μs, <0.5% error vs geodesic; no PostGIS round-trip |
-| Corridor filter | Bounding box + polyline samples | 50 samples, O(m) per station; avoids expensive spatial SQL |
+| Corridor filter | PostGIS ST_DWithin (GIST) | Spatial SQL pushdown replaces Python haversine; 50-200ms → ~5ms |
+| Distance calc | Haversine (Python fallback) | ~0.5μs, <0.5% error; only used when PostGIS unavailable |
 | Detour penalty | 2x in effective distance | Disincentivizes detours without hard cutoff |
 | Cache backend | Redis + in-process LRU | Sub-millisecond reads; in-process avoids serialization |
-| Price versioning | Version ID in cache key | Automatic invalidation on price update |
+| Price versioning | Version ID in cache key | Automatic invalidation on price update; Redis synced across workers |
 | Geocoding | Parallel (2 workers) | Cuts geocode latency ~50% for dual-address requests |
 | Short routes | <500mi fast path | Skip station query entirely — fits in one tank |
 | Minimum fill | 5 gallons | Prevents micro-stops that add time with negligible savings |
+| Rate limiting | AnonRateThrottle (1000/hr) | DRF throttle class prevents API abuse |
+| Observability | /route/health/ | DB/cache status, request counters, cache hit metrics |
 
 ---
 
@@ -323,28 +325,30 @@ flowchart TD
 ```mermaid
 flowchart TD
     A[Route polyline from Google Directions] --> B[Decode polyline to coordinates]
-    B --> C[Sample 50 points along route]
-    C --> D[Compute bounding box ±3° lat/lon]
-    D --> E[Django ORM: FuelStation.objects.filter]
-    E --> F[Stage 1: Bounding box filter in PostgreSQL]
-    F --> G[Stage 2: Start/end proximity check in Python]
-    G --> H[Stage 3: Polyline corridor check - haversine distance to nearest sample point]
-    H --> I{Within buffer miles of polyline?}
-    I -->|Yes| J[Include station with price]
-    I -->|No| K[Skip station]
-    J --> L[Return filtered station list]
+    B --> C[Build PostGIS LineString geometry]
+    C --> D[PostGIS ST_DWithin query]
+    D --> E{PostGIS available?}
+    E -->|Yes| F[GIST-indexed spatial query on location_point]
+    F --> G[All stations within CORRIDOR_BUFFER_MILES of route line]
+    E -->|No - Fallback| H[Bounding box pre-filter]
+    H --> I[Python haversine corridor check]
+    I --> J[Filtered stations within buffer distance]
+    G --> K[Attach prices by OPIS ID lookup]
+    J --> K
+    K --> L[Cache corridor station IDs in Redis]
+    L --> M[Return station list with prices]
 ```
 
 ### Spatial Filtering Stages
 
 | Stage | Method | Cost | Selectivity |
 |-------|--------|------|-------------|
-| 1. Bounding box | PostgreSQL range query (`latitude__gte`, etc.) | Indexed, ~10μs | Reduces 100k → ~5k stations |
-| 2. Proximity | Haversine to start/end (Python) | O(1) per station | Filters distant outliers |
-| 3. Corridor | Haversine to 50 polyline samples (Python) | O(50) per station | Final corridor pass |
-| 4. Price filter | Dict lookup by OPIS ID | O(1) per station | Removes stations without pricing |
+| 1. PostGIS corridor | `ST_DWithin(route_linestring, D(mi=50))` using GIST index on `location_point` | ~5ms | 5141 stations → 50-200 in corridor |
+| 2. Price filter | Dict lookup by OPIS ID | O(1) per station | Removes stations without pricing |
+| 3. Fallback bbox | `latitude__gte/lte` + `longitude__gte/lte` range query | ~10μs (indexed) | Reduces 100k → ~5k stations |
+| 4. Fallback corridor | Haversine to 50 polyline samples (Python) | O(50) per station | Final corridor pass |
 
-**Why not PostGIS for corridor filtering?** Python haversine against 50 sampled polyline points gives identical results to `ST_DWithin` without serialization overhead or geospatial index maintenance. For 100 stations × 50 samples = 5,000 distance calculations, total cost is ~2.5ms in Python vs ~5-10ms including PostGIS round-trip.
+**PostGIS pushdown**: The original Python haversine corridor loop (O(stations × 50 samples) = ~25ms for 1000 stations) is replaced with a single `ST_DWithin` query using a GIST index on `FuelStation.location_point` (PointField with `geography=True`). This reduces corridor filtering to ~5ms and scales sub-linearly with station count. If PostGIS is unavailable, the system falls back to the Python haversine pipeline transparently.
 
 ---
 
@@ -426,11 +430,13 @@ Examples:
 | Metric | Value |
 |--------|-------|
 | Total tests | 180 |
-| Average response time | 201 ms |
-| Median response time | 87 ms |
-| P95 response time | 1,100 ms |
-| Slow responses (>5s) | 0 |
+| Average response time | 1,772 ms |
+| Median response time | ~1,200 ms |
+| P95 response time | ~3,800 ms |
+| Slow responses (>5s) | 3 (1.7%) |
 | Cache hit rate (hot) | ~95% |
+
+> Note: Average response time includes Google Directions API latency (~800-2000ms per uncached route). Optimization and station query time alone averages ~50ms. Repeated runs warm caches and drop to ~5-15ms for hot requests.
 
 ### Latency Profile by Scenario
 
@@ -451,7 +457,8 @@ Examples:
 |-----------|-------------|--------------|-------|
 | Google Geocoding (2× parallel) | ~600ms | ~2ms (Redis) | Parallel execution halves wall time |
 | Google Directions API | ~800-2,000ms | ~5ms (RouteCache) | Most expensive single operation |
-| DB Station Query | ~50-200ms | ~50-200ms | Bounded by bbox index |
+| DB Station Query (PostGIS) | ~5-50ms | ~5-50ms | GIST-indexed ST_DWithin; sub-linear scaling |
+| DB Station Query (fallback) | ~50-200ms | ~50-200ms | Bbox + Python haversine when PostGIS unavailable |
 | Polyline decode + snap | ~5-15ms | ~0.001ms (GeometryCache) | LRU eliminates repeat work |
 | Greedy+Lookahead | ~10-50ms | ~10-50ms | Pure computation, no caching |
 | Serialization | ~1-5ms | ~1-5ms | Minimal overhead |
@@ -460,13 +467,15 @@ Examples:
 
 | Technique | Impact |
 |-----------|--------|
+| PostGIS ST_DWith + GIST index | Replaces 250k haversine calcs (~125ms) with ~5ms spatial query |
 | Request coalescing (Redis locks) | Eliminates N+1 Google API calls for concurrent same-route requests |
 | Module-level ThreadPoolExecutor | Avoids per-request thread pool creation (saves ~50ms) |
 | In-process LRU geometry cache | Eliminates repeat polyline decode (saves ~5-15ms per route) |
-| Haversine over PostGIS | ~2.5ms vs ~5-10ms for corridor filtering |
+| Corridor Station Cache (Redis) | Stores filtered OPIS IDs; eliminates repeat spatial queries per route |
+| Redis price version sync | Multi-worker consistency with one GET per 30s per worker |
 | Batch price fetch (dict) | Eliminates N+1 price queries per station |
 | Price-versioned cache keys | Zero-cost cache invalidation on price updates |
-| Sampled polyline (50 pts) | O(50) vs O(1000+) per corridor check — 20x fewer distance calc |
+| Health endpoint counters | Module-level _request_counter + _cache_hit_counters with periodic logging |
 
 ---
 
@@ -521,11 +530,16 @@ Examples:
 | `VEHICLE_RESERVE_MILES` | 50 | Reserved fuel buffer (miles) |
 | `LOOKAHEAD_MILES` | 200 | Lookahead window for price comparison |
 | `MAX_DETOUR_MILES` | 5 | Maximum station detour distance |
-| `CORRIDOR_BUFFER_MILES` | 50 | Polyline corridor width |
+| `CORRIDOR_BUFFER_MILES` | 50 | PostGIS ST_DWithin corridor width (miles) |
+| `MIN_DESTINATION_RESERVE_GALLONS` | 5 | Minimum fuel remaining at destination |
 | `GOOGLE_API_KEY` | — | Google Maps API key |
 | `CACHE_TTL['OPTIMIZATION']` | 3600 | Optimization cache TTL (seconds) |
 | `CACHE_TTL['ROUTE_GEOMETRY']` | 86400 | Route cache TTL (seconds) |
 | `CACHE_TTL['GEOCODE']` | 604800 | Geocode cache TTL (seconds) |
+| `THROTTLE_RATE['anon']` | 1000/hour | DRF AnonRateThrottle limit |
+| `_PRICE_VERSION_CACHE_TTL` | 30s | Price version in-process cache TTL |
+| `REDIS_PRICE_VERSION_TTL` | 60s | Price version Redis sync key TTL |
+| `CHECK_INTERVAL` | 10 | GeometryCache Redis version check interval (get calls) |
 
 ---
 
@@ -603,7 +617,46 @@ A hard "must be within 5 miles of route" would include stations at 5 miles while
 
 Haversine distance has <0.5% error relative to the WGS-84 ellipsoid for distances and latitudes common in US driving routes. At ~0.5μs per call vs ~50μs for geopy's geodesic, it's 100x faster. For station proximity checks where "within 50 miles" is the threshold (not "exactly 47.3 miles"), this error is irrelevant.
 
-### 13. Batch Price Fetch
+### 14. PostGIS Corridor Pushdown
+
+**Chosen**: PostGIS `ST_DWithin` with GIST index. **Rejected**: Python haversine corridor loop.
+
+The original design avoided PostGIS based on the premise that "Python haversine against 50 sampled polyline points is faster than a spatial SQL round-trip." This is true for small station counts (<100) but breaks down at scale. With 5141 stations in the database, the bbox pre-filter still returns ~5000 candidates per route, requiring 5000 × 50 = 250,000 haversine calculations (~125ms). A single `ST_DWithin` query with a GIST index on `location_point` reduces this to ~5ms, scaling sub-linearly with station density.
+
+The PointField uses `geography=True` (meters-based distance on WGS-84 spheroid), so `D(mi=50)` automatically converts to meters. The GIST index enables index-assisted `ST_DWithin` — PostGIS reads only the geometry index entries within range rather than scanning the full table.
+
+### 15. Distributed Cache Consistency (Multi-Worker)
+
+**Chosen**: Redis-backed version sync with in-process LRU. **Rejected**: Exclusively in-process or exclusively Redis caches.
+
+In a multi-worker Gunicorn deployment, each worker maintains its own in-process caches (price version, geometry LRU). Without synchronization, when a price update changes the active PriceVersion, workers may serve stale optimizations for up to 30 seconds (the in-process cache TTL).
+
+Two Redis sync mechanisms mitigate this:
+
+| Mechanism | What It Syncs | Cost |
+|-----------|--------------|------|
+| `cache.set('price_version:active', id, 60)` | Price version ID written to Redis after DB fetch | One Redis SET per 30s per worker |
+| `cache.get('price_version:active')` | Checked before DB query on cache miss | One Redis GET per 30s per worker |
+| `geometry_cache:version` | Clears in-process LRU when routes are re-processed | One Redis GET per 10th LRU access |
+
+### 16. Rate Limiting
+
+**Chosen**: DRF `AnonRateThrottle` at 1000 requests/hour. **Rejected**: No rate limiting, per-IP limiting.
+
+Without rate limiting, a misbehaving client or accidental infinite loop could exhaust Google API quota. DRF's built-in `AnonRateThrottle` (1000 requests/hour) uses the `CACHES` backend (Redis in production, local memory in development) with no additional infrastructure. The throttle scope is `anon`, and 429 responses include a `Retry-After` header.
+
+### 17. Observability (Health Endpoint)
+
+**Chosen**: Dedicated `/route/health/` endpoint returning system status. **Rejected**: Third-party monitoring, log-based health.
+
+The health endpoint (`fuel_routing/views.py`) provides:
+- **Database connectivity**: verifies `FuelStation` table is accessible and reports active station count + price version
+- **Cache connectivity**: read/write check against the configured cache backend
+- **Request metrics**: total requests processed and optimization cache hit count (tracked via module-level counters)
+
+This enables simple load-balancer health checks (returning `status: degraded` instead of 500 when dependencies fail) and at-a-glance diagnostics without external monitoring tools.
+
+### 18. Batch Price Fetch
 
 **Chosen**: Load all active prices into a dict once. **Rejected**: per-station price queries.
 
@@ -696,6 +749,7 @@ Each test checks: response time, cost consistency, fuel accounting, stop math, c
 ```
 fuel_routing/
 ├── api.py                # REST API endpoint (DRF ViewSet)
+├── views.py              # Health check and system diagnostics endpoints
 ├── engine.py             # Orchestration: geocode → route → stations → optimize → select
 ├── cache_service.py      # Unified optimization cache with key normalization
 ├── cache_utils.py        # GeometryCache LRU, CorridorStationCache Redis, locks, key gen
@@ -710,7 +764,6 @@ fuel_routing/
 ├── models.py             # Django ORM models (FuelStation, FuelPrice, RouteCache, PriceVersion)
 ├── serializers.py        # DRF request/response serializers
 ├── preprocessing.py      # CSV data preprocessing pipeline
-├── signals.py            # Django signals
 ├── apps.py               # Django app config
 ├── management/commands/
 │   └── preprocess_fuel_data.py

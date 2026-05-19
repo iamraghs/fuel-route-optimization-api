@@ -12,6 +12,10 @@ LOOKAHEAD_MILES = settings.FUEL_OPTIMIZATION_LOOKAHEAD_MILES      # 200 miles
 
 MIN_DESTINATION_RESERVE_GALLONS = 5  # Minimum fuel remaining at destination (safety reserve)
 
+# Cache TTLs (centralized from settings to avoid per-module settings import)
+CACHE_TTL_GEOCODE = settings.CACHE_TTL['GEOCODING']   # 7 days
+CACHE_TTL_ROUTE = settings.CACHE_TTL['ROUTE_GEOMETRY']  # 24 hours
+
 GOOGLE_API_KEY = settings.GOOGLE_MAPS_API_KEY
 GOOGLE_ROUTES_ENDPOINT = settings.GOOGLE_ROUTES_API_ENDPOINT
 GOOGLE_GEOCODING_ENDPOINT = settings.GOOGLE_GEOCODING_API_ENDPOINT

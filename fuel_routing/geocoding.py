@@ -10,7 +10,7 @@ from django.core.cache import cache
 from django.utils import timezone
 
 from .cache_utils import EnhancedCacheKeyGenerator, RequestLockManager, RouteNormalizer
-from .constants import GOOGLE_API_KEY, GOOGLE_GEOCODING_ENDPOINT
+from .constants import GOOGLE_API_KEY, GOOGLE_GEOCODING_ENDPOINT, CACHE_TTL_GEOCODE
 from .models import GeocodeFailure
 from .route_geometry import _fast_distance_miles
 
@@ -76,7 +76,7 @@ class GeocodingService:
                     longitude=geometry['lng']
                 )
 
-                cache.set(cache_key, asdict(location), settings.CACHE_TTL['GEOCODING'])
+                cache.set(cache_key, asdict(location), CACHE_TTL_GEOCODE)
                 logger.info(f"Geocoded {address} -> ({location.latitude:.6f}, {location.longitude:.6f})")
                 return location
 
@@ -96,7 +96,7 @@ class GeocodingService:
             lock_key=lock_key,
             result_key=cache_key,
             compute_fn=compute_geocode,
-            cache_ttl=settings.CACHE_TTL['GEOCODING']
+            cache_ttl=CACHE_TTL_GEOCODE
         )
 
         if result is None:
