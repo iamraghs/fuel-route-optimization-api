@@ -572,33 +572,31 @@ class FuelRouteOptimizationEngine:
             })
         response_total_cost = float(response_total_cost_decimal)
 
-        # Estimate cost from average price when no stations found
+        # Detect infeasible routes: no stations found, or stops don't cover full distance
         no_stations_available = (
             not selected_stops and selected_route.distance_miles > VEHICLE_MAX_RANGE
         )
+        insufficient_coverage = False
         pv_id = _get_active_price_version()
         avg_price = _get_avg_price_for_version(pv_id)
-
-        if no_stations_available:
-            estimated_fuel_cost = round(
-                (selected_route.distance_miles / VEHICLE_MPG) * avg_price, 2
-            )
-            logger.warning(
-                f"[{request_id}] No fuel stations found. "
-                f"Estimated cost at ${avg_price:.2f}/gal: ${estimated_fuel_cost:.2f}"
-            )
-        else:
-            estimated_fuel_cost = response_total_cost
 
         # Fuel accounting
         if selected_stops:
             last_stop_fuel_after = float(selected_stops[-1].fuel_after_refuel)
             last_stop_dist = selected_stops[-1].distance_from_start
             final_leg_miles = selected_route.distance_miles - last_stop_dist
+            unclamped_remaining = last_stop_fuel_after - final_leg_miles / VEHICLE_MPG
             fuel_remaining_val = max(
                 float(MIN_DESTINATION_RESERVE_GALLONS),
-                last_stop_fuel_after - final_leg_miles / VEHICLE_MPG
+                unclamped_remaining
             )
+            if unclamped_remaining < 0:
+                insufficient_coverage = True
+                logger.warning(
+                    f"[{request_id}] Insufficient fuel coverage: "
+                    f"last stop at {last_stop_dist:.0f}mi leaves {unclamped_remaining:.1f}gal "
+                    f"for remaining {final_leg_miles:.0f}mi leg"
+                )
         elif no_stations_available:
             fuel_remaining_val = 0.0
         else:
@@ -614,23 +612,36 @@ class FuelRouteOptimizationEngine:
             VEHICLE_TANK + fuel_purchased_total - fuel_remaining_val
         )
 
-        # For infeasible routes (no stations, distance > max range),
+        # For infeasible routes (no stations or stops don't cover full distance),
         # report distance-based fuel consumption (not tank-constrained)
         # and show the deficit as negative remaining — the negative value
         # communicates "you'd run out X gallons before finishing."
-        if no_stations_available:
+        infeasible = no_stations_available or insufficient_coverage
+        if infeasible:
             actual_fuel_consumed = selected_route.distance_miles / VEHICLE_MPG
-            fuel_remaining_val = VEHICLE_TANK - actual_fuel_consumed
+            fuel_remaining_val = VEHICLE_TANK + fuel_purchased_total - actual_fuel_consumed
+
+        # Compute cost estimate — use distance-based for infeasible routes
+        if infeasible:
+            estimated_fuel_cost = round(
+                (selected_route.distance_miles / VEHICLE_MPG) * avg_price, 2
+            )
+            logger.warning(
+                f"[{request_id}] {'No stations' if no_stations_available else 'Insufficient coverage'}. "
+                f"Estimated cost at ${avg_price:.2f}/gal: ${estimated_fuel_cost:.2f}"
+            )
+        else:
+            estimated_fuel_cost = response_total_cost
 
         # Generate Google Maps navigation link
         route_map_link = _build_map_link(start_input, end_input, start_loc, end_loc)
 
         response = {
             '_cache_hit': False,
-            'route_feasible': not no_stations_available,
+            'route_feasible': not infeasible,
             'optimization_confidence': (
-                'high' if selected_stops
-                else 'insufficient_data' if no_stations_available
+                'high' if selected_stops and not insufficient_coverage
+                else 'insufficient_data' if infeasible
                 else 'estimated'
             ),
             'status': 'success',
@@ -652,10 +663,14 @@ class FuelRouteOptimizationEngine:
                 'route_id': selected_route.route_id,
                 'distance_miles': round(selected_route.distance_miles, 1),
                 'is_optimal': True,
-                'reason': 'Lowest cost-per-mile efficiency' if not no_stations_available else 'Estimated (no station data available)',
+                'reason': (
+                    'Lowest cost-per-mile efficiency'
+                    if not infeasible
+                    else 'Estimated (insufficient station coverage)'
+                ),
                 'estimated_total_fuel_consumption_gallons': round(actual_fuel_consumed, 1),
                 'estimated_total_fuel_cost': (
-                    estimated_fuel_cost if no_stations_available else response_total_cost
+                    estimated_fuel_cost if infeasible else response_total_cost
                 ),
                 'fuel_stops_required': len(selected_stops),
                 'route_polyline': selected_route.polyline_encoded,
@@ -663,17 +678,22 @@ class FuelRouteOptimizationEngine:
                 'warning': (
                     'No fuel stations found in database for this route corridor. '
                     'Fuel cost is estimated.'
-                ) if no_stations_available else None,
+                ) if no_stations_available else (
+                    'Insufficient station coverage for complete optimization. '
+                    'Fuel stops do not cover full route distance.'
+                ) if insufficient_coverage else None,
             },
             'route_comparison': [
                 {
                     'route_id': r.route_id,
                     'distance_miles': round(r.distance_miles, 1),
                     'estimated_total_fuel_cost': (
-                        response_total_cost
+                        estimated_fuel_cost
+                        if (infeasible and r.route_id == selected_route.route_id)
+                        else round((r.distance_miles / VEHICLE_MPG) * avg_price, 2)
+                        if infeasible
+                        else response_total_cost
                         if (s and r.route_id == selected_route.route_id)
-                        else estimated_fuel_cost
-                        if (no_stations_available and r.route_id == selected_route.route_id)
                         else float(sum(
                             round(float(s_obj.price_per_gallon), 2) * round(s_obj.gallons_to_buy, 1)
                             for s_obj in s
@@ -692,12 +712,12 @@ class FuelRouteOptimizationEngine:
                 'total_distance_miles': round(selected_route.distance_miles, 1),
                 'total_fuel_consumed_gallons': round(actual_fuel_consumed, 1),
                 'total_fuel_cost': (
-                    estimated_fuel_cost if no_stations_available else response_total_cost
+                    estimated_fuel_cost if infeasible else response_total_cost
                 ),
                 'average_price_per_gallon': (
                     float(response_total_cost / fuel_purchased_total) if selected_stops
                     else (estimated_fuel_cost / (selected_route.distance_miles / VEHICLE_MPG)
-                          if no_stations_available else 0)
+                          if infeasible else 0)
                 ),
                 'total_fuel_stops': len(selected_stops),
                 'starting_fuel_gallons': VEHICLE_TANK,
