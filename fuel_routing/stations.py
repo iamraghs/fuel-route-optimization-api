@@ -58,37 +58,42 @@ class FuelStationQueryService:
             end_lat = float(ne.get('lat', 0))
             end_lon = float(ne.get('lng', 0))
 
-            filtered_stations = []
+            # Pre-compute tight polyline bbox for quick rejection (avoids haversine for distant stations)
             poly_points = list(sampled_polyline_coords or [])
+            if poly_points:
+                poly_lats = [p[0] for p in poly_points]
+                poly_lons = [p[1] for p in poly_points]
+                poly_lat_min, poly_lat_max = min(poly_lats), max(poly_lats)
+                poly_lon_min, poly_lon_max = min(poly_lons), max(poly_lons)
+                deg_buffer = buffer_miles / 69.0
+            else:
+                poly_lat_min = min(start_lat, end_lat) - 2.0
+                poly_lat_max = max(start_lat, end_lat) + 2.0
+                poly_lon_min = min(start_lon, end_lon) - 2.0
+                poly_lon_max = max(start_lon, end_lon) + 2.0
+                deg_buffer = 0.0
+
+            filtered_stations = []
 
             for station in pre_queried_stations:
                 sta_lat = float(station['latitude'])
                 sta_lon = float(station['longitude'])
 
-                dist_to_start = _fast_distance_miles(sta_lat, sta_lon, start_lat, start_lon)
-                dist_to_end = _fast_distance_miles(sta_lat, sta_lon, end_lat, end_lon)
+                # Fast bbox check (no trig) before expensive haversine loop
+                in_corridor_bbox = (
+                    poly_lat_min - deg_buffer <= sta_lat <= poly_lat_max + deg_buffer and
+                    poly_lon_min - deg_buffer <= sta_lon <= poly_lon_max + deg_buffer
+                )
 
-                is_near_start = dist_to_start <= buffer_miles + 100
-                is_near_end = dist_to_end <= buffer_miles + 100
+                if not in_corridor_bbox:
+                    continue
 
-                lat_min = min(start_lat, end_lat) - 2.0
-                lat_max = max(start_lat, end_lat) + 2.0
-                lon_min = min(start_lon, end_lon) - 2.0
-                lon_max = max(start_lon, end_lon) + 2.0
-
-                is_in_route_box = (lat_min <= sta_lat <= lat_max and
-                                  lon_min <= sta_lon <= lon_max)
-
-                is_near_polyline = False
-                if poly_points and (is_near_start or is_near_end or is_in_route_box):
+                if poly_points:
                     for plat, plon in poly_points:
                         if _fast_distance_miles(sta_lat, sta_lon, plat, plon) <= buffer_miles:
-                            is_near_polyline = True
+                            filtered_stations.append(station)
                             break
-                elif is_near_start or is_near_end or is_in_route_box:
-                    is_near_polyline = True
-
-                if is_near_polyline:
+                else:
                     filtered_stations.append(station)
 
             # Cache filtered OPIS IDs for this route corridor

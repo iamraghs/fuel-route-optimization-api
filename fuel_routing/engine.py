@@ -3,7 +3,7 @@ import hashlib
 import logging
 import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -368,7 +368,6 @@ class FuelRouteOptimizationEngine:
             merged_lon_max = max(start_loc.longitude, end_loc.longitude)
 
         opis_ids_with_prices = list(all_prices.keys())
-        all_route_stations = []
 
         # OPTIMIZED: Per-route PostGIS corridor query with automatic fallback
         def _load_route_stations(route):
@@ -426,53 +425,46 @@ class FuelRouteOptimizationEngine:
                         f"falling back to bbox+Python filter"
                     )
 
-            # Fallback: load full bbox once, then Python-filter per route
-            nonlocal all_route_stations
-            if not all_route_stations:
-                try:
-                    all_lats, all_lons = [], []
-                    for r in routes:
-                        bounds = r.bounds if isinstance(r.bounds, dict) else {}
-                        sw, ne = bounds.get('sw', {}), bounds.get('ne', {})
-                        slat = sw.get('lat') or sw.get('latitude')
-                        slon = sw.get('lng') or sw.get('longitude')
-                        nelat = ne.get('lat') or ne.get('latitude')
-                        nelon = ne.get('lng') or ne.get('longitude')
-                        if all(v is not None for v in [slat, slon, nelat, nelon]):
-                            all_lats.extend([slat, nelat])
-                            all_lons.extend([slon, nelon])
-                    if all_lats and all_lons:
-                        lat_min, lat_max = min(all_lats), max(all_lats)
-                        lon_min, lon_max = min(all_lons), max(all_lons)
-                        for st in FuelStation.objects.filter(
-                            is_active=True, opis_id__in=opis_ids_with_prices,
-                            latitude__gte=lat_min - 3.0, latitude__lte=lat_max + 3.0,
-                            longitude__gte=lon_min - 3.0, longitude__lte=lon_max + 3.0,
-                        ).values(
-                            'opis_id', 'name', 'address', 'city', 'state', 'latitude', 'longitude'
-                        ).iterator():
-                            price = all_prices.get(st['opis_id'])
-                            if price and price > 0:
-                                st['price_per_gallon'] = price
-                                st['latitude'] = float(st['latitude'])
-                                st['longitude'] = float(st['longitude'])
-                                all_route_stations.append(dict(st))
-                except Exception as e:
-                    logger.warning(f"[{request_id}] Bbox station query failed: {e}")
+            # Fallback: load bbox and Python-filter per route (self-contained, no shared state)
+            try:
+                bounds = route.bounds if isinstance(route.bounds, dict) else {}
+                sw, ne = bounds.get('sw', {}), bounds.get('ne', {})
+                slat = sw.get('lat') or sw.get('latitude')
+                slon = sw.get('lng') or sw.get('longitude')
+                nelat = ne.get('lat') or ne.get('latitude')
+                nelon = ne.get('lng') or ne.get('longitude')
+                if all(v is not None for v in [slat, slon, nelat, nelon]):
+                    lat_pad, lon_pad = 3.0, 3.0
+                    lat_min, lat_max = min(slat, nelat), max(slat, nelat)
+                    lon_min, lon_max = min(slon, nelon), max(slon, nelon)
+                    route_bbox_stations = []
+                    for st in FuelStation.objects.filter(
+                        is_active=True, opis_id__in=opis_ids_with_prices,
+                        latitude__gte=lat_min - lat_pad, latitude__lte=lat_max + lat_pad,
+                        longitude__gte=lon_min - lon_pad, longitude__lte=lon_max + lon_pad,
+                    ).values(
+                        'opis_id', 'name', 'address', 'city', 'state', 'latitude', 'longitude'
+                    ).iterator():
+                        price = all_prices.get(st['opis_id'])
+                        if price and price > 0:
+                            st['price_per_gallon'] = price
+                            st['latitude'] = float(st['latitude'])
+                            st['longitude'] = float(st['longitude'])
+                            route_bbox_stations.append(dict(st))
+                    return FuelStationQueryService.filter_stations_by_route(
+                        route, route_bbox_stations
+                    ) if route_bbox_stations else []
+            except Exception as e:
+                logger.warning(f"[{request_id}] Fallback station query failed: {e}")
 
-            return FuelStationQueryService.filter_stations_by_route(
-                route, all_route_stations
-            ) if all_route_stations else []
+            return []
 
-        # Optimize each route using per-route corridor query
+        # Optimize each route — run corridor queries and fuel optimization in parallel
         route_optimizations = []
-        for route_idx, route in enumerate(routes):
-            logger.info(f"[{request_id}] === Processing {route.route_id} ===")
 
+        def _optimize_single_route(route):
+            """Load stations, pre-snap, and calculate fuel stops for one route."""
             route_stations = _load_route_stations(route)
-            logger.info(
-                f"[{request_id}] Found {len(route_stations)} stations in corridor"
-            )
 
             # Pre-snap stations to route
             if route_stations and route.polyline_encoded:
@@ -489,7 +481,6 @@ class FuelRouteOptimizationEngine:
                     station['_detour_miles'] = detour
 
             if not route_stations:
-                logger.warning(f"[{request_id}] No stations found for {route.route_id}")
                 stops = []
             else:
                 stops = FuelOptimizer.calculate_fuel_stops(
@@ -497,8 +488,18 @@ class FuelRouteOptimizationEngine:
                 )
 
             total_cost = float(sum(s.fuel_cost for s in stops))
-            logger.info(f"[{request_id}] {route.route_id} total cost: ${total_cost:.2f}")
-            route_optimizations.append((route, stops, total_cost))
+            return route, stops, total_cost
+
+        routes_list = list(routes)
+        with ThreadPoolExecutor(max_workers=len(routes_list)) as executor:
+            futures = {executor.submit(_optimize_single_route, r): r for r in routes_list}
+            for future in as_completed(futures):
+                opt_route, opt_stops, opt_cost = future.result()
+                route_optimizations.append((opt_route, opt_stops, opt_cost))
+                logger.info(
+                    f"[{request_id}] {opt_route.route_id} complete: "
+                    f"{len(opt_stops)} stops, ${opt_cost:.2f}"
+                )
 
         # Select best route
         selected_route, selected_stops, selected_cost = \
