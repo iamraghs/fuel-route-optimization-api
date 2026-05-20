@@ -30,7 +30,7 @@ class FuelStationQueryService:
             return []
 
         # Check corridor station cache
-        cached_ids = CorridorStationCache.get(route.route_id, buffer_miles)
+        cached_ids = CorridorStationCache.get(route.route_id, buffer_miles, route.polyline_encoded or '')
         if cached_ids is not None:
             id_set = set(cached_ids)
             filtered = [s for s in pre_queried_stations if s['opis_id'] in id_set]
@@ -98,7 +98,7 @@ class FuelStationQueryService:
 
             # Cache filtered OPIS IDs for this route corridor
             opis_ids = [s['opis_id'] for s in filtered_stations]
-            CorridorStationCache.set(route.route_id, buffer_miles, opis_ids)
+            CorridorStationCache.set(route.route_id, buffer_miles, opis_ids, route.polyline_encoded or '')
 
             logger.info(
                 f"Filtered {len(filtered_stations)} stations for "

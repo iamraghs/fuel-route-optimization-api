@@ -6,7 +6,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
 from django.conf import settings
@@ -372,7 +372,7 @@ class FuelRouteOptimizationEngine:
         # OPTIMIZED: Per-route PostGIS corridor query with automatic fallback
         def _load_route_stations(route):
             """Load stations for a route using PostGIS corridor query (with fallback)."""
-            cached_ids = CorridorStationCache.get(route.route_id, CORRIDOR_BUFFER_MILES)
+            cached_ids = CorridorStationCache.get(route.route_id, CORRIDOR_BUFFER_MILES, route.polyline_encoded or '')
             if cached_ids is not None:
                 db_stations = FuelStation.objects.filter(
                     opis_id__in=list(cached_ids), is_active=True
@@ -398,25 +398,25 @@ class FuelRouteOptimizationEngine:
                         route_line = LineString(
                             [(float(lon), float(lat)) for lat, lon in all_coords], srid=4326
                         )
-                        with transaction.atomic():
-                            qs = FuelStation.objects.filter(
-                                is_active=True,
-                                opis_id__in=opis_ids_with_prices,
-                                location_point__dwithin=(route_line, D(mi=CORRIDOR_BUFFER_MILES)),
-                            ).values(
-                                'opis_id', 'name', 'address', 'city', 'state', 'latitude', 'longitude'
-                            )
-                            result = []
-                            for s in qs.iterator():
-                                price = all_prices.get(s['opis_id'])
-                                if price and price > 0:
-                                    s['price_per_gallon'] = price
-                                    s['latitude'] = float(s['latitude'])
-                                    s['longitude'] = float(s['longitude'])
-                                    result.append(s)
+                        qs = FuelStation.objects.filter(
+                            is_active=True,
+                            opis_id__in=opis_ids_with_prices,
+                            location_point__dwithin=(route_line, D(mi=CORRIDOR_BUFFER_MILES)),
+                        ).values(
+                            'opis_id', 'name', 'address', 'city', 'state', 'latitude', 'longitude'
+                        )
+                        result = []
+                        for s in qs.iterator():
+                            price = all_prices.get(s['opis_id'])
+                            if price and price > 0:
+                                s['price_per_gallon'] = price
+                                s['latitude'] = float(s['latitude'])
+                                s['longitude'] = float(s['longitude'])
+                                result.append(s)
                         CorridorStationCache.set(
                             route.route_id, CORRIDOR_BUFFER_MILES,
-                            [s['opis_id'] for s in result]
+                            [s['opis_id'] for s in result],
+                            route.polyline_encoded or ''
                         )
                         return result
                 except Exception:
@@ -487,7 +487,31 @@ class FuelRouteOptimizationEngine:
                     route, route_stations, start_loc, end_loc
                 )
 
-            total_cost = float(sum(s.fuel_cost for s in stops))
+            # Compute total cost for this route
+            # Actual stop costs for feasible routes; full distance-based estimate for infeasible.
+            # This keeps selection consistent with the comparison display — without this,
+            # a route with one cheap stop (partial coverage) unfairly beats a shorter route
+            # that would actually cost less for the full trip.
+            if route.distance_miles > VEHICLE_MAX_RANGE:
+                if not stops:
+                    # No stations found — use full distance estimate
+                    pv_local = _get_active_price_version()
+                    ap_local = get_cached_avg_price(pv_local)
+                    total_cost = (route.distance_miles / VEHICLE_MPG) * ap_local
+                else:
+                    stop_cost = float(sum(s.fuel_cost for s in stops))
+                    last_stop_fuel_after = float(stops[-1].fuel_after_refuel)
+                    last_stop_dist = stops[-1].distance_from_start
+                    final_leg_miles = route.distance_miles - last_stop_dist
+                    if last_stop_fuel_after < final_leg_miles / VEHICLE_MPG:
+                        # Stops don't cover full distance — use full estimate for fair comparison
+                        pv_local = _get_active_price_version()
+                        ap_local = get_cached_avg_price(pv_local)
+                        total_cost = (route.distance_miles / VEHICLE_MPG) * ap_local
+                    else:
+                        total_cost = stop_cost
+            else:
+                total_cost = float(sum(s.fuel_cost for s in stops))
             return route, stops, total_cost
 
         routes_list = list(routes)
@@ -548,12 +572,10 @@ class FuelRouteOptimizationEngine:
         elapsed_ms = int((time.time() - start_time) * 1000)
 
         fuel_stops_response = []
-        response_total_cost_decimal = Decimal('0')
+        response_total_cost = 0.0
         for i, s in enumerate(selected_stops):
-            price_display = round(float(s.price_per_gallon), 2)
-            gallons_display = round(s.gallons_to_buy, 1)
-            stop_cost = round(price_display * gallons_display, 2)
-            response_total_cost_decimal += Decimal(str(stop_cost))
+            stop_cost = float(s.fuel_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+            response_total_cost += stop_cost
             fuel_stops_response.append({
                 'stop_number': i + 1,
                 'station_name': s.station_name,
@@ -561,8 +583,8 @@ class FuelRouteOptimizationEngine:
                 'state': s.state,
                 'address': s.address or '',
                 'mile_marker': round(s.distance_from_start, 1),
-                'fuel_price_per_gallon': price_display,
-                'gallons_to_buy': gallons_display,
+                'fuel_price_per_gallon': float(s.price_per_gallon),
+                'gallons_to_buy': round(s.gallons_to_buy, 1),
                 'fuel_cost': stop_cost,
                 'detour_miles': round(
                     s.detour_miles if s.detour_miles is not None else 0.0, 1
@@ -571,7 +593,7 @@ class FuelRouteOptimizationEngine:
                     s.cost_per_mile if s.cost_per_mile is not None else 0.0, 3
                 ),
             })
-        response_total_cost = float(response_total_cost_decimal)
+        response_total_cost = round(response_total_cost, 2)
 
         # Detect infeasible routes: no stations found, or stops don't cover full distance
         no_stations_available = (
@@ -665,7 +687,7 @@ class FuelRouteOptimizationEngine:
                 'distance_miles': round(selected_route.distance_miles, 1),
                 'is_optimal': True,
                 'reason': (
-                    'Lowest cost-per-mile efficiency'
+                    'Lowest total fuel cost'
                     if not infeasible
                     else 'Estimated (insufficient station coverage)'
                 ),
@@ -691,17 +713,9 @@ class FuelRouteOptimizationEngine:
                     'estimated_total_fuel_cost': (
                         estimated_fuel_cost
                         if (infeasible and r.route_id == selected_route.route_id)
-                        else round((r.distance_miles / VEHICLE_MPG) * avg_price, 2)
-                        if infeasible
                         else response_total_cost
-                        if (s and r.route_id == selected_route.route_id)
-                        else float(sum(
-                            round(float(s_obj.price_per_gallon), 2) * round(s_obj.gallons_to_buy, 1)
-                            for s_obj in s
-                        )) if s
-                        else round((r.distance_miles / VEHICLE_MPG) * avg_price, 2)
-                        if (not s and r.distance_miles > VEHICLE_MAX_RANGE)
-                        else 0
+                        if (not infeasible and r.route_id == selected_route.route_id)
+                        else round(c, 2)
                     ),
                     'fuel_stops_required': len(s),
                     'selected': r.route_id == selected_route.route_id

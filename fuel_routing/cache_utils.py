@@ -60,6 +60,19 @@ class GeometryCache:
             pass  # Redis unavailable — fall through
 
     @classmethod
+    def clear_if_needed(cls):
+        """Force a Redis version check and clear in-process cache if geometry data is stale.
+
+        Unlike _check_redis_version (called every N gets), this explicitly checks
+        the Redis version key on every call. Useful when external invalidation is
+        known to have occurred (e.g., routes were re-processed by another worker).
+        """
+        saved = cls._check_counter
+        cls._check_counter += cls._CHECK_INTERVAL  # Force check on next _check_redis_version
+        cls._check_redis_version()
+        cls._check_counter = saved
+
+    @classmethod
     def make_key(cls, polyline_encoded: str) -> str:
         """Generate deterministic key from encoded polyline."""
         return hashlib.md5(polyline_encoded.encode()).hexdigest()
@@ -109,16 +122,24 @@ class CorridorStationCache:
 
     Avoids repeated polyline-based corridor filtering for the same route.
     Stores only OPIS IDs (not full station data), so price changes don't invalidate.
+
+    Keys include a polyline content hash to prevent cross-route collisions:
+    route_id is reused across requests (route_a / route_b), so without the
+    polyline discriminator, cached station IDs from one start→end pair could
+    be served for a different route with the same letter label.
     """
 
     @staticmethod
-    def _make_key(route_id: str, buffer_miles: float) -> str:
-        return f"{CORRIDOR_CACHE_PREFIX}:{route_id}:buf{int(buffer_miles)}"
+    def _make_key(route_id: str, buffer_miles: float, polyline: str = '') -> str:
+        discriminator = ''
+        if polyline:
+            discriminator = ':' + hashlib.md5(polyline.encode()).hexdigest()[:12]
+        return f"{CORRIDOR_CACHE_PREFIX}:{route_id}{discriminator}:buf{int(buffer_miles)}"
 
     @staticmethod
-    def get(route_id: str, buffer_miles: float) -> Optional[List[int]]:
+    def get(route_id: str, buffer_miles: float, polyline: str = '') -> Optional[List[int]]:
         """Get cached station OPIS IDs for a route corridor."""
-        key = CorridorStationCache._make_key(route_id, buffer_miles)
+        key = CorridorStationCache._make_key(route_id, buffer_miles, polyline)
         try:
             result = cache.get(key)
             if result is not None:
@@ -129,11 +150,11 @@ class CorridorStationCache:
         return None
 
     @staticmethod
-    def set(route_id: str, buffer_miles: float, opis_ids: List[int]):
+    def set(route_id: str, buffer_miles: float, opis_ids: List[int], polyline: str = ''):
         """Cache station OPIS IDs for a route corridor."""
         if not opis_ids:
             return
-        key = CorridorStationCache._make_key(route_id, buffer_miles)
+        key = CorridorStationCache._make_key(route_id, buffer_miles, polyline)
         try:
             cache.set(key, opis_ids, CORRIDOR_CACHE_TTL)
             logger.debug(f"Cached {len(opis_ids)} corridor station IDs: {key}")
@@ -144,14 +165,15 @@ class CorridorStationCache:
     def get_or_compute(
         route_id: str,
         buffer_miles: float,
-        compute_fn: Callable[[], List[int]]
+        compute_fn: Callable[[], List[int]],
+        polyline: str = '',
     ) -> List[int]:
         """Get cached corridor station IDs or compute and cache."""
-        cached = CorridorStationCache.get(route_id, buffer_miles)
+        cached = CorridorStationCache.get(route_id, buffer_miles, polyline)
         if cached is not None:
             return cached
         opis_ids = compute_fn()
-        CorridorStationCache.set(route_id, buffer_miles, opis_ids)
+        CorridorStationCache.set(route_id, buffer_miles, opis_ids, polyline)
         return opis_ids
 
 

@@ -20,8 +20,6 @@ class FuelStationAdmin(admin.ModelAdmin):
     # Filters for quick navigation
     list_filter = (
         'state', 'is_active', 'city', 'created_at',
-        ('latitude', admin.EmptyFieldListFilter),
-        ('longitude', admin.EmptyFieldListFilter),
     )
     
     # Search capability

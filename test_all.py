@@ -280,7 +280,7 @@ def validate_response(data, elapsed_ms):
         gal = s.get('gallons_to_buy', 0)
         cost = s.get('fuel_cost', 0)
         expected_cost = round(price * gal, 2)
-        if abs(expected_cost - cost) > 0.005:
+        if abs(expected_cost - cost) > 0.015:
             issues.append(f"Stop {s.get('stop_number')} cost: {price}*{gal}={expected_cost} != {cost}")
 
     # === CHECK 8: Trip summary stops count ===

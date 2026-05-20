@@ -33,19 +33,15 @@ class FuelStopSerializer(serializers.Serializer):
     gallons_to_buy = serializers.SerializerMethodField()
     fuel_cost = serializers.SerializerMethodField()
     detour_miles = serializers.SerializerMethodField()
-    cost_per_mile = serializers.SerializerMethodField()
-
     def get_mile_marker(self, obj):
         """Round mile marker to 1 decimal place."""
         value = obj.get('mile_marker', 0)
         return round(float(value), 1)
 
     def get_fuel_price_per_gallon(self, obj):
-        """Format price to 2 decimal places (cents)."""
+        """Format price with DB precision."""
         value = obj.get('fuel_price_per_gallon', 0)
-        if isinstance(value, Decimal):
-            return float(value)
-        return round(float(value), 2)
+        return float(value)
 
     def get_gallons_to_buy(self, obj):
         """Round gallons to 1 decimal place."""
@@ -64,18 +60,13 @@ class FuelStopSerializer(serializers.Serializer):
         value = obj.get('detour_miles', 0)
         return round(float(value), 1)
 
-    def get_cost_per_mile(self, obj):
-        """Fuel cost per mile for this stop segment."""
-        value = obj.get('cost_per_mile', 0)
-        if isinstance(value, Decimal):
-            return float(value)
-        return round(float(value), 3)
-
 
 class SelectedRouteSerializer(serializers.Serializer):
     """Selected route details - CLEAN FORMAT (proper precision)."""
     route_id = serializers.CharField(max_length=20)
     distance_miles = serializers.SerializerMethodField()
+    is_optimal = serializers.BooleanField(required=False)
+    reason = serializers.CharField(required=False, allow_null=True)
     estimated_total_fuel_consumption_gallons = serializers.SerializerMethodField()
     estimated_total_fuel_cost = serializers.SerializerMethodField()
     fuel_stops_required = serializers.IntegerField()
@@ -154,10 +145,8 @@ class TripSummarySerializer(serializers.Serializer):
         return round(float(value), 2)
     
     def get_average_price_per_gallon(self, obj):
-        """Format to 2 decimal places (cents)."""
+        """Format price to 2 decimal places (cents)."""
         value = obj.get('average_price_per_gallon', 0)
-        if isinstance(value, Decimal):
-            return float(value)
         return round(float(value), 2)
     
     def get_starting_fuel_gallons(self, obj):
@@ -211,7 +200,11 @@ class FuelOptimizationRequestSerializer(serializers.Serializer):
 
 class FuelOptimizationResponseSerializer(serializers.Serializer):
     """Fuel optimization API response - CLEAN, PRODUCTION FORMAT (proper precision)."""
-    
+
+    status = serializers.CharField(required=False)
+    request_id = serializers.CharField(required=False)
+    optimization_time_ms = serializers.IntegerField(required=False)
+    route_feasible = serializers.BooleanField(required=False)
     request = RequestInfoSerializer()
     selected_route = SelectedRouteSerializer()
     route_comparison = RouteComparisonSerializer(many=True)
