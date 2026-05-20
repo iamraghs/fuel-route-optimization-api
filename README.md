@@ -17,7 +17,7 @@ Production-grade API that finds the most fuel-efficient route between two US loc
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  API Layer (api.py)                                                     │
 │  • Request validation & serialization                                   │
-│  • Response formatting with _cache_hit, optimization_time_ms            │
+│  • Response formatting with request_id, status                           │
 └─────────────────────────┬───────────────────────────────────────────────┘
                           │
                           ▼
@@ -90,13 +90,16 @@ api.py → engine.py → cache_service.py → cache_utils.py (Redis locks, key g
 
 ```json
 {
+  "status": "success",
+  "request_id": "a1b2c3d4",
   "selected_route": {
     "route_id": "route_b",
     "distance_miles": 1480.5,
+    "is_optimal": true,
+    "reason": "Lowest total fuel cost",
     "estimated_total_fuel_consumption_gallons": 148.0,
     "estimated_total_fuel_cost": 510.42,
     "fuel_stops_required": 2,
-    "route_polyline": "{encoded_polyline}",
     "route_map_link": "https://www.google.com/maps/dir/..."
   },
   "fuel_stops": [
@@ -106,11 +109,10 @@ api.py → engine.py → cache_service.py → cache_utils.py (Redis locks, key g
       "city": "Oklahoma City",
       "state": "OK",
       "mile_marker": 430.2,
-      "fuel_price_per_gallon": 3.45,
+      "fuel_price_per_gallon": 3.449,
       "gallons_to_buy": 22.5,
-      "fuel_cost": 77.63,
-      "detour_miles": 0.8,
-      "cost_per_mile": 0.181
+      "fuel_cost": 77.60,
+      "detour_miles": 0.8
     }
   ],
   "route_comparison": [
@@ -139,10 +141,7 @@ api.py → engine.py → cache_service.py → cache_utils.py (Redis locks, key g
     "fuel_purchased_at_stops": 98.0,
     "total_fuel_available": 148.0,
     "fuel_remaining_at_destination": 0.0
-  },
-  "optimization_time_ms": 87,
-  "request_id": "a1b2c3d4",
-  "_cache_hit": false
+  }
 }
 ```
 
@@ -256,7 +255,7 @@ flowchart TD
     K --> L[Greedy + 200mi Lookahead optimization]
     L --> M{More routes?}
     M -->|Yes| J
-    M -->|No| N[Select best route by cost-per-mile]
+    M -->|No| N[Select best route by total fuel cost]
     N --> O[Cache optimization result]
     O --> P[Return response]
 ```
@@ -364,7 +363,7 @@ flowchart TD
     E --> G[Calculate cost-per-mile for Route B]
     F --> H{Compare routes}
     G --> H
-    H --> I[Select: lowest cost-per-mile]
+    H --> I[Select: lowest total fuel cost]
     I --> J[Tiebreaker: fewest stops]
     J --> K[Tiebreaker: shortest distance]
     K --> L[Return selected route + comparison]
@@ -374,11 +373,11 @@ flowchart TD
 
 Routes are compared on three criteria in order:
 
-1. **Cost-per-mile** (primary) — total fuel cost divided by route distance. Most economically efficient route wins.
+1. **Total fuel cost** (primary) — absolute fuel cost for the entire trip. Cheapest route wins.
 2. **Fuel stop count** (tiebreaker) — fewer stops means faster total trip time.
 3. **Total distance** (final tiebreaker) — shorter route wins if costs are equivalent.
 
-This prioritizes economic efficiency over absolute lowest total cost because a shorter route with slightly higher total cost may have better cost-per-mile (less fuel consumed overall).
+This prioritizes absolute lowest cost, which is the economically correct choice for the driver's total fuel expenditure.
 
 ---
 
@@ -430,10 +429,9 @@ Examples:
 | Metric | Value |
 |--------|-------|
 | Total tests | 180 |
-| Average response time | 1,772 ms |
-| Median response time | ~1,200 ms |
-| P95 response time | ~3,800 ms |
-| Slow responses (>5s) | 3 (1.7%) |
+| Pass rate | 180/180 (100%) |
+| Average response time | 484 ms |
+| Slow responses (>5s) | 0 (0%) |
 | Cache hit rate (hot) | ~95% |
 
 > Note: Average response time includes Google Directions API latency (~800-2000ms per uncached route). Optimization and station query time alone averages ~50ms. Repeated runs warm caches and drop to ~5-15ms for hot requests.
@@ -770,3 +768,20 @@ fuel_routing/
 └── tests/
     └── test_all.py       # 180-route validation suite
 ```
+
+---
+
+## Changelog
+
+### Latest Improvements
+
+| Change | Description |
+|--------|-------------|
+| **Decimal costing** | Stop costs computed via Decimal arithmetic (no float rounding); `price × gallons = cost` holds exactly |
+| **Route comparison fix** | Primary sort key changed from `cost_per_mile` to `total_fuel_cost` — absolute cheapest route wins |
+| **Infeasible route costing** | Routes with insufficient station coverage use distance-based cost estimate for fair comparison |
+| **Corridor cache key fix** | Polyline content hash added to `CorridorStationCache` key to prevent cross-route collisions |
+| **Response serializer completeness** | Added `status`, `request_id`, `is_optimal`, `reason` to API response (were silently dropped) |
+| **Price precision preserved** | `fuel_price_per_gallon` now shows full DB precision (3dp) — no artificial rounding to 2dp |
+| **Read-only transaction removed** | Removed unnecessary `transaction.atomic()` wrapper around PostGIS corridor query |
+| **Route comparison consistency** | Non-selected routes now display their actual optimizer-computed cost, not a recomputed value |

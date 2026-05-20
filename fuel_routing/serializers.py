@@ -203,8 +203,6 @@ class FuelOptimizationResponseSerializer(serializers.Serializer):
 
     status = serializers.CharField(required=False)
     request_id = serializers.CharField(required=False)
-    optimization_time_ms = serializers.IntegerField(required=False)
-    route_feasible = serializers.BooleanField(required=False)
     request = RequestInfoSerializer()
     selected_route = SelectedRouteSerializer()
     route_comparison = RouteComparisonSerializer(many=True)
