@@ -1,92 +1,42 @@
 # Fuel Route Optimization API
 
-Production-grade API that finds the most fuel-efficient route between two US locations, optimizing fuel stops to minimize total cost. Built with Django 5.0, PostGIS, and Redis.
+An API that finds fuel-efficient routes between two US locations by optimizing where and how much to refuel along the way. It takes two locations, figures out the best route options, decides which fuel stations to stop at and how much fuel to buy at each one, all while trying to minimize the total fuel cost for the trip.
 
-**Stack**: Django 5.0 + DRF + PostgreSQL/PostGIS + Redis + Google Maps APIs (Directions + Geocoding)
+Built with Django, DRF, PostgreSQL with PostGIS for spatial queries, and Redis for caching. Uses Google Maps APIs for directions and geocoding.
 
 ---
 
-## Architecture Overview
+## What This Project Does
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│  Client (POST /route/fuel-optimization/)                                │
-└─────────────────────────┬───────────────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  API Layer (api.py)                                                     │
-│  • Request validation & serialization                                   │
-│  • Response formatting with request_id, status                           │
-└─────────────────────────┬───────────────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  Engine (engine.py)                ◄── Cache Service (cache_service.py) │
-│  • GeocodingService                 ◄── Request coalescing (Redis)      │
-│  • RoutingService                   ◄── Optimization cache (Redis)      │
-│  • FuelStationQueryService                                               │
-│  • FuelOptimizer                                                         │
-│  • RouteComparator                                                        │
-└──────┬──────────┬──────────┬──────────┬─────────────────────────────────┘
-       │          │          │          │
-       ▼          ▼          ▼          ▼
-┌─────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐
-│ Google  │ │Geocoding │ │ Google   │ │ PostgreSQL/      │
-│Geocoding│ │ Cache    │ │Directions│ │ PostGIS          │
-│   API   │ │(Redis)   │ │   API    │ │ • FuelStation    │
-└─────────┘ └──────────┘ └──────────┘ │ • FuelPrice      │
-                                      │ • RouteCache     │
-                                      │ • PriceVersion   │
-                                      └──────────────────┘
-```
+The problem is straightforward: a truck needs to go from one city to another. It starts with a full tank. Along the way there are fuel stations with different prices. The API figures out:
 
-### Module Dependency Graph
+- Which fuel stations to stop at
+- How much fuel to buy at each stop
+- Which route alternative gives the lowest total fuel cost
 
-```
-api.py → engine.py → cache_service.py → cache_utils.py (Redis locks, key gen)
-                   → geocoding.py      → cache_utils.py
-                   → routing.py        → cache_utils.py, geocoding.py
-                   → stations.py       → cache_utils.py, geocoding.py, routing.py, route_geometry.py
-                   → optimizer.py      → cache_utils.py, route_geometry.py, geocoding.py
-                   → route_selector.py → optimizer.py
-                   → route_geometry.py → cache_utils.py
-```
-
-### Key Design Decisions
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Algorithm | Greedy + 200mi Lookahead | O(n log n) vs DP O(n²); within 2-3% of optimal |
-| Route alternatives | 2 (not 3+) | Diminishing returns beyond 2; avoids excess Google API cost |
-| Corridor filter | PostGIS ST_DWithin (GIST) | Spatial SQL pushdown replaces Python haversine; 50-200ms → ~5ms |
-| Distance calc | Haversine (Python fallback) | ~0.5μs, <0.5% error; only used when PostGIS unavailable |
-| Detour penalty | 2x in effective distance | Disincentivizes detours without hard cutoff |
-| Cache backend | Redis + in-process LRU | Sub-millisecond reads; in-process avoids serialization |
-| Price versioning | Version ID in cache key | Automatic invalidation on price update; Redis synced across workers |
-| Geocoding | Parallel (2 workers) | Cuts geocode latency ~50% for dual-address requests |
-| Short routes | <500mi fast path | Skip station query entirely — fits in one tank |
-| Minimum fill | 5 gallons | Prevents micro-stops that add time with negligible savings |
-| Rate limiting | AnonRateThrottle (1000/hr) | DRF throttle class prevents API abuse |
-| Observability | /route/health/ | DB/cache status, request counters, cache hit metrics |
+It handles everything from a short 50-mile trip (where you don't need to stop at all) to a cross-country 3000-mile run with multiple stops.
 
 ---
 
 ## API Reference
 
-### `POST /route/fuel-optimization/`
+### POST /route/fuel-optimization/
 
-**Request** (address strings or lat/lng coordinates):
+Takes a start and finish location. Both can be either an address string or a lat/lng coordinate pair.
+
+**Request with addresses:**
 
 ```json
 {"start": "Los Angeles, CA", "finish": "New York, NY"}
 ```
 
+**Request with coordinates:**
+
 ```json
 {"start": {"lat": 34.0522, "lng": -118.2437}, "finish": {"lat": 40.7128, "lng": -74.0060}}
 ```
 
-**Response**:
+**Response:**
 
 ```json
 {
@@ -145,548 +95,101 @@ api.py → engine.py → cache_service.py → cache_utils.py (Redis locks, key g
 }
 ```
 
-**Response Headers**:
-
-| Header | Value | Description |
-|--------|-------|-------------|
-| `X-Request-ID` | UUID | Request tracking |
-| `X-Cache` | HIT/MISS | Optimization cache status |
-| `X-Response-Time` | ms | Total server processing time |
+The response includes the selected route with its fuel stops, comparison data for all route alternatives, and a trip summary with full fuel accounting.
 
 ---
 
-## Request Lifecycle
+## How It Works
 
-### Full Cold Path (no cache)
+### Request Flow
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant API as API Layer
-    participant E as Engine
-    participant CS as Cache Service
-    participant G as Geocoding
-    participant R as Routing
-    participant S as Stations
-    participant O as Optimizer
+When a request comes in, the first thing that happens is a cache check. If someone has already asked for the same route with the same fuel prices, the cached response comes back immediately without any API calls or computation.
 
-    C->>API: POST /route/fuel-optimization/
-    API->>E: optimize(start, end)
-    E->>CS: get_cached_optimization(key)
-    CS-->>E: MISS (null)
-    E->>G: geocode(start) + geocode(end) [parallel]
-    G->>Google: Geocoding API (2 requests)
-    Google-->>G: lat/lng coordinates
-    G-->>E: Location objects
-    E->>R: get_routes(start, end)
-    R->>Google: Directions API (alternatives=true)
-    Google-->>R: 2 route alternatives
-    R-->>E: [RouteAlternative, RouteAlternative]
-    E->>S: get_stations_in_corridor(route, buffer)
-    S->>DB: FuelStation query (bbox + polyline filter)
-    DB-->>S: station list with prices
-    S-->>E: station candidates
-    E->>O: calculate_fuel_stops(route, stations)
-    O->>O: Greedy + Lookahead selection
-    O-->>E: [FuelStopDetail, ...]
-    E->>E: select best route (cost-per-mile)
-    E->>CS: set_cached_optimization(key, result)
-    CS-->>E: OK
-    E-->>API: OptimizationResult
-    API-->>C: JSON Response (201ms avg)
-```
+If its a cache miss, the system geocodes the start and end locations in parallel (two threads). Once it has coordinates, it calls the Google Directions API to get up to two route alternatives.
 
-### Hot Path (fully cached)
+For routes under 500 miles, the API takes a fast path. A full tank covers that distance, so theres no need to search for fuel stations at all. The response comes back with zero fuel stops and an estimated cost based on average fuel price.
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant API as API Layer
-    participant E as Engine
-    participant CS as Cache Service
+For longer routes, the system queries the fuel station database to find stations near each route. It uses PostGIS spatial queries to find stations within a corridor along the route. This is much faster than loading all stations and filtering in Python.
 
-    C->>API: POST /route/fuel-optimization/
-    API->>E: optimize(start, end)
-    E->>CS: get_cached_optimization(key)
-    CS-->>E: HIT (cached result)
-    E-->>API: OptimizationResult (+ _cache_hit=true)
-    API-->>C: JSON Response (5-15ms)
-```
+Each route alternative goes through the optimization engine independently. The optimizer figures out the best fuel stops, then the route comparator picks the one with the lowest total fuel cost.
 
-### Warm Path (partial cache)
+The result gets cached in Redis so the next request for the same route returns instantly.
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant E as Engine
-    participant CS as Cache Service
-    participant G as Geocoding
-    participant R as Routing
-    participant RC as RouteCache
+### Fuel Optimization Strategy
 
-    C->>E: optimize(start, end)
-    E->>CS: get_cached_optimization(key)
-    CS-->>E: MISS
-    E->>G: geocode(start) + geocode(end)
-    G->>G: Redis cache HIT (geocoding)
-    G-->>E: Location objects
-    E->>R: get_routes(start, end)
-    R->>RC: check RouteCache (PostgreSQL)
-    RC-->>R: CACHED routes (Directions cached)
-    R-->>E: route alternatives
-    Note over E: station query + optimization (uncached)
-    E-->>C: Response (100-400ms)
-```
+The optimizer uses what I call a range-aware greedy approach. It starts at position zero with a full tank and works its way toward the destination.
 
-### Optimization Pipeline
+At each decision point (which is every time it considers a stop), it figures out how far it can actually go based on current fuel level and the reserve requirement. Only stations within that reachable range are considered as candidates.
 
-```mermaid
-flowchart TD
-    A[Start] --> B{Optimization Cache Hit?}
-    B -->|Yes| C[Return cached result + _cache_hit=true]
-    B -->|No| D[Geocode start & end in parallel]
-    D --> E{Fetch routes from Google Directions API}
-    E --> F[Decode polylines & precompute distances]
-    F --> G{Total route < 500 miles?}
-    G -->|Yes - Short route| H[Return no stations needed]
-    G -->|No| I[Query stations in corridor]
-    I --> J[For each route alternative:]
-    J --> K[Snap stations to route polyline]
-    K --> L[Greedy + 200mi Lookahead optimization]
-    L --> M{More routes?}
-    M -->|Yes| J
-    M -->|No| N[Select best route by total fuel cost]
-    N --> O[Cache optimization result]
-    O --> P[Return response]
-```
+The decision logic works like this:
+
+If the destination is reachable from a candidate station after filling up, and theres no cheaper station ahead that we can reach directly, then this is the last stop. Buy only what you need to get to the destination, nothing extra.
+
+If theres a cheaper station within range from the candidate station, but we cant reach it directly from where we are now, buy just enough fuel at this station to make it to that cheaper station.
+
+If theres no cheaper station ahead within the range we would have after filling up, fill the tank. This maximizes flexibility for whatever comes next.
+
+The algorithm recomputes everything at every stop. It doesnt commit to a multi-stop plan and then follow it blindly. After each stop, it re-evaluates using the current fuel level and position. This is important because new stations become reachable as you move forward.
+
+### Safety Guards
+
+A few things keep the optimization practical:
+
+- Minimum 5-gallon purchase prevents micro-stops that waste time
+- Stops too close together (under 80 miles with plenty of fuel) get skipped
+- A 50-mile reserve ensures you never run dry
+- Stations more than 5 miles off the route are excluded
+- If skipping a station would leave no other options, the algorithm fills up anyway to keep moving
+
+### Caching
+
+There are several layers of caching because the costliest part of this system is the Google API calls.
+
+The optimization cache stores the full API response in Redis for an hour. The cache key includes the price version ID, so when fuel prices update, old cached responses naturally become different keys and stop being served.
+
+Route geometry from Google Directions gets cached in PostgreSQL for 24 hours. Geocoding results go to Redis for 7 days. Station corridor filters (which stations are near which route) get cached in Redis for an hour.
+
+There is also an in-process cache for decoded polyline geometry that avoids repeated decoding of the same route data during a single request.
+
+Request coalescing prevents duplicate Google API calls. If two people ask for the same route at the same time, only one request goes to Google. The other waits for the result.
+
+### Station Query
+
+For each route, the system needs to find fuel stations along the corridor. It starts with all stations that have active prices, then filters them using PostGIS spatial queries. The stations table has a GIST index on the location point, so this is a fast spatial lookup rather than a full table scan.
+
+If PostGIS isnt available (like in test environments with SQLite), it falls back to a bounding box pre-filter followed by a haversine distance check against the route polyline.
 
 ---
 
-## Algorithm: Greedy + Lookahead
-
-The optimizer uses a greedy approach with a 200-mile lookahead window instead of dynamic programming:
-
-### Station Selection Logic
-
-```mermaid
-flowchart TD
-    A[Start at current position with current fuel] --> B[Find all reachable unvisited stations]
-    B --> C{Any reachable stations?}
-    C -->|No| D[Route not completable - return stops so far]
-    C -->|Yes| E[Sort candidates by distance from start]
-    E --> F[For each candidate in sorted order:]
-    F --> G[Look ahead 200 miles for cheaper stations]
-    G --> H{Cheaper station reachable?}
-    H -->|Yes| I[Partial fill - buy just enough to reach cheaper station]
-    H -->|No| J[Full fill - fill tank to capacity]
-    I --> K[Add fuel stop]
-    J --> K
-    K --> L{Micro-purchase < 5 gal?}
-    L -->|Yes| M[Skip stop, mark visited, continue]
-    L -->|No| N{Tight stop < 80mi from last with >60% fuel?}
-    N -->|Yes| M
-    N -->|No| O[Accept stop, advance position]
-    O --> P{Destination reachable with remaining fuel?}
-    P -->|No| B
-    P -->|Yes| Q[Done]
-```
-
-### Algorithm Characteristics
-
-| Property | Value |
-|----------|-------|
-| Time complexity | O(n log n) per route |
-| Lookahead window | 200 miles |
-| Optimality gap | 2-3% from theoretical DP optimum |
-| Memory | O(n) — no DP table |
-| Typical stops evaluated | 50-200 per route |
-| Worst-case iterations | Capped at 200 |
-
-**Why not DP?** The 500-mile tank range bounds the problem space. DP's O(n²) cost doesn't buy meaningful improvement when the greedy lookahead already achieves 97-98% optimality at <5% of the computation cost.
-
-### Key Parameters
-
-| Parameter | Value | Rationale |
-|-----------|-------|-----------|
-| Tank capacity | 50 gal | Standard semi-truck fuel tank |
-| Fuel efficiency | 10 MPG | Average loaded semi-truck |
-| Max range | 500 miles | Legal driving limit (~8 hours) |
-| Reserve | 50 miles | Safety buffer for unexpected conditions |
-| Lookahead | 200 miles | Balances optimality vs computation |
-| Max detour | 5 miles | Realistic fuel station accessibility |
-| Minimum purchase | 5 gallons | Prevents micro-stops |
-| Tight-stop filter | <80mi + >60% fuel | Eliminates unnecessary clustering |
-
----
-
-## Geospatial Query Pipeline
-
-```mermaid
-flowchart TD
-    A[Route polyline from Google Directions] --> B[Decode polyline to coordinates]
-    B --> C[Build PostGIS LineString geometry]
-    C --> D[PostGIS ST_DWithin query]
-    D --> E{PostGIS available?}
-    E -->|Yes| F[GIST-indexed spatial query on location_point]
-    F --> G[All stations within CORRIDOR_BUFFER_MILES of route line]
-    E -->|No - Fallback| H[Bounding box pre-filter]
-    H --> I[Python haversine corridor check]
-    I --> J[Filtered stations within buffer distance]
-    G --> K[Attach prices by OPIS ID lookup]
-    J --> K
-    K --> L[Cache corridor station IDs in Redis]
-    L --> M[Return station list with prices]
-```
-
-### Spatial Filtering Stages
-
-| Stage | Method | Cost | Selectivity |
-|-------|--------|------|-------------|
-| 1. PostGIS corridor | `ST_DWithin(route_linestring, D(mi=50))` using GIST index on `location_point` | ~5ms | 5141 stations → 50-200 in corridor |
-| 2. Price filter | Dict lookup by OPIS ID | O(1) per station | Removes stations without pricing |
-| 3. Fallback bbox | `latitude__gte/lte` + `longitude__gte/lte` range query | ~10μs (indexed) | Reduces 100k → ~5k stations |
-| 4. Fallback corridor | Haversine to 50 polyline samples (Python) | O(50) per station | Final corridor pass |
-
-**PostGIS pushdown**: The original Python haversine corridor loop (O(stations × 50 samples) = ~25ms for 1000 stations) is replaced with a single `ST_DWithin` query using a GIST index on `FuelStation.location_point` (PointField with `geography=True`). This reduces corridor filtering to ~5ms and scales sub-linearly with station count. If PostGIS is unavailable, the system falls back to the Python haversine pipeline transparently.
-
----
-
-## Route Processing Pipeline
-
-```mermaid
-flowchart TD
-    A[Google Directions API returns 2 routes] --> B[Route A decoding & validation]
-    A --> C[Route B decoding & validation]
-    B --> D[Compute fuel stops for Route A]
-    C --> E[Compute fuel stops for Route B]
-    D --> F[Calculate cost-per-mile for Route A]
-    E --> G[Calculate cost-per-mile for Route B]
-    F --> H{Compare routes}
-    G --> H
-    H --> I[Select: lowest total fuel cost]
-    I --> J[Tiebreaker: fewest stops]
-    J --> K[Tiebreaker: shortest distance]
-    K --> L[Return selected route + comparison]
-```
-
-### Route Comparison Criteria
-
-Routes are compared on three criteria in order:
-
-1. **Total fuel cost** (primary) — absolute fuel cost for the entire trip. Cheapest route wins.
-2. **Fuel stop count** (tiebreaker) — fewer stops means faster total trip time.
-3. **Total distance** (final tiebreaker) — shorter route wins if costs are equivalent.
-
-This prioritizes absolute lowest cost, which is the economically correct choice for the driver's total fuel expenditure.
-
----
-
-## Caching Architecture
-
-### Cache Hierarchy (7 layers)
-
-| # | Cache | Backend | TTL | Key Format | Content | Hit Latency |
-|---|-------|---------|-----|------------|---------|-------------|
-| 1 | **Optimization** | Redis | 1 hour | `fuel_routing:optimization:v1:{hash}:pv{ver}` | Full API response | ~1ms |
-| 2 | **Route** | PostgreSQL | 24 hours | `{start_lat}_{start_lon}_{end_lat}_{end_lon}` | Route geometry + metadata | ~5ms |
-| 3 | **Geocoding** | Redis | 7 days | `fuel_routing:geocode:v1:{address_hash}` | Location lat/lng | ~1ms |
-| 4 | **Geometry** | In-process LRU | 200 entries | MD5(polyline) | Coords, cum dist, samples | ~0.001ms |
-| 5 | **Corridor stations** | Redis | 1 hour | `fuel_routing:corridor:v1:{id}:buf{int}` | List of OPIS IDs in corridor | ~1ms |
-| 6 | **Price version** | In-process | 30s poll | version_id → timestamp | Active price version ID | ~0.001ms |
-| 7 | **Avg price** | In-process | Per-version | price_version_id → float | Average fuel price | ~0.001ms |
-
-### Cache Key Design
+## Project Structure
 
 ```
-Unified format: fuel_routing:{domain}:v{version}:{entity_hash}:pv{price_version}
-
-Examples:
-  fuel_routing:optimization:v1:a1b2c3d4e5f6:pv42
-  fuel_routing:geocode:v1:e3f4g5h6i7j8
-  fuel_routing:corridor:v1:route_a:buf50
+fuel_routing/
+  api.py              - REST API endpoint
+  views.py            - Health check endpoint
+  engine.py           - Main orchestrator that ties everything together
+  optimizer.py        - Fuel stop optimization algorithm
+  cache_service.py    - Optimization result cache layer
+  cache_utils.py      - Geometry cache, corridor cache, request locking
+  routing.py          - Google Directions API integration
+  geocoding.py        - Google Geocoding API integration
+  stations.py         - Fuel station query and filtering
+  route_selector.py   - Route comparison and selection
+  route_geometry.py   - Route validation and stop sequencing
+  constants.py        - Vehicle parameters and configuration
+  models.py           - Database models
+  serializers.py      - Request/response serializers
+  preprocessing.py    - CSV data preprocessing pipeline
 ```
-
-**Why version in the key?** When fuel prices update, a new PriceVersion is activated. The old cache key becomes a different key automatically — no explicit invalidation needed. This prevents stale-price responses without cache-busting logic.
-
-### Cache Invalidation Strategy
-
-| Event | Action | Mechanism |
-|-------|--------|-----------|
-| Price update | Auto-invalidation | New PriceVersion ID changes cache key |
-| New station added | TTL expiration | Corridor station cache expires after 1h |
-| Route geometry change | TTL expiration | Route cache expires after 24h |
-| Geocode correction | TTL expiration | Geocode cache expires after 7 days |
-| Emergency flush | `cache.clear()` | Clears all Redis caches |
-
-**No explicit invalidation needed.** All caches are time-bound or key-versioned. Price updates rotate the PriceVersion, which changes the optimization cache key, naturally bypassing stale entries.
-
----
-
-## Performance
-
-### Benchmark Results (180 test routes)
-
-| Metric | Value |
-|--------|-------|
-| Total tests | 180 |
-| Pass rate | 180/180 (100%) |
-| Average response time | 484 ms |
-| Slow responses (>5s) | 0 (0%) |
-| Cache hit rate (hot) | ~95% |
-
-> Note: Average response time includes Google Directions API latency (~800-2000ms per uncached route). Optimization and station query time alone averages ~50ms. Repeated runs warm caches and drop to ~5-15ms for hot requests.
-
-### Latency Profile by Scenario
-
-| Scenario | Cache State | Latency | Components Hit |
-|----------|-------------|---------|----------------|
-| Short route (<500mi), cached | Hot | 5-15ms | Redis optimization cache |
-| Short route (<500mi), uncached | Warm | 100-250ms | Geocode (Redis cache), Directions API |
-| Long route, fully cached | Hot | 5-15ms | Redis optimization cache |
-| Long route, cached geocode + routes | Warm | 100-400ms | Station DB query, optimization computation |
-| Long route, fully uncached | Cold | 1,500-3,000ms | Geocoding API (2×), Directions API, DB query, optimization |
-| Concurrent duplicate requests | Coalesced | Same as single | Only one request hits Google APIs |
-| Station query cached | Corridor warm | -50ms vs full | Redis corridor station cache hit |
-| Geometry cached | In-process | -2ms vs decode | In-process LRU geometry cache hit |
-
-### Latency Breakdown (Cold Path)
-
-| Component | Cold Latency | Warm Latency | Notes |
-|-----------|-------------|--------------|-------|
-| Google Geocoding (2× parallel) | ~600ms | ~2ms (Redis) | Parallel execution halves wall time |
-| Google Directions API | ~800-2,000ms | ~5ms (RouteCache) | Most expensive single operation |
-| DB Station Query (PostGIS) | ~5-50ms | ~5-50ms | GIST-indexed ST_DWithin; sub-linear scaling |
-| DB Station Query (fallback) | ~50-200ms | ~50-200ms | Bbox + Python haversine when PostGIS unavailable |
-| Polyline decode + snap | ~5-15ms | ~0.001ms (GeometryCache) | LRU eliminates repeat work |
-| Greedy+Lookahead | ~10-50ms | ~10-50ms | Pure computation, no caching |
-| Serialization | ~1-5ms | ~1-5ms | Minimal overhead |
-
-### Performance Engineering Highlights
-
-| Technique | Impact |
-|-----------|--------|
-| PostGIS ST_DWith + GIST index | Replaces 250k haversine calcs (~125ms) with ~5ms spatial query |
-| Request coalescing (Redis locks) | Eliminates N+1 Google API calls for concurrent same-route requests |
-| Module-level ThreadPoolExecutor | Avoids per-request thread pool creation (saves ~50ms) |
-| In-process LRU geometry cache | Eliminates repeat polyline decode (saves ~5-15ms per route) |
-| Corridor Station Cache (Redis) | Stores filtered OPIS IDs; eliminates repeat spatial queries per route |
-| Redis price version sync | Multi-worker consistency with one GET per 30s per worker |
-| Batch price fetch (dict) | Eliminates N+1 price queries per station |
-| Price-versioned cache keys | Zero-cost cache invalidation on price updates |
-| Health endpoint counters | Module-level _request_counter + _cache_hit_counters with periodic logging |
-
----
-
-## Production Engineering
-
-### Google API Minimization
-
-| Safeguard | Mechanism | Impact |
-|-----------|-----------|--------|
-| Route caching | RouteCache (PostgreSQL, 24h) | Only 1 API call per route per day regardless of request volume |
-| Geocode caching | Redis (7d TTL) | Redis persists across server restarts; 7-day window covers 99% of repeat geocodes |
-| Request coalescing | Redis SET NX lock (30s) | At most 1 request hits Google for any route at a time |
-| 2-route limit | `max_alternatives=2` | Directions API returns up to 3 by default; we cap at 2 to reduce processing |
-| Short-route fast path | <500mi | Zero Google API dependency for majority of requests |
-
-### Concurrency Safety
-
-| Concern | Solution |
-|---------|----------|
-| Cache stampede | RequestLockManager.coalesce_request() with Redis distributed lock |
-| Race condition on geocode | Module-level in-process cache (5min TTL) prevents duplicate concurrent geocodes |
-| Thread safety (in-process caches) | OrderedDict LRU is thread-safe for reads; dict operations are atomic in CPython |
-| Price version consistency | Single DB query at start of request, shared across all routes |
-
-### Memory Efficiency
-
-| Structure | Max Size | Memory per Entry | Total Budget |
-|-----------|----------|-----------------|--------------|
-| Geometry LRU | 200 entries | ~10KB (polyline with 1000+ points) | ~2MB |
-| Location cache | Unlimited (5min TTL) | ~200 bytes per entry | ~2MB (10k entries) |
-| Price lookup dict | All active prices | ~100 bytes per station | ~5MB (50k stations) |
-| Thread pool | 2 workers | ~1MB per thread stack | ~2MB |
-
-### Connection Pooling
-
-| Service | Pool Size | Keep-Alive | Timeout |
-|---------|-----------|------------|---------|
-| Google Directions API | 4 connections | Enabled | 10s read / 5s connect |
-| Google Geocoding API | 4 connections | Enabled | 10s read / 5s connect |
-| PostgreSQL | Django default (typically 4-20) | Enabled | Configurable |
-| Redis | Connection pool (10) | Enabled | Configurable |
-
----
-
-## System Configuration
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `VEHICLE_MPG` | 10 | Miles per gallon (semi-truck efficiency) |
-| `VEHICLE_TANK` | 50 | Fuel tank capacity in gallons |
-| `VEHICLE_MAX_RANGE` | 500 | Maximum range on full tank (miles) |
-| `VEHICLE_RESERVE_MILES` | 50 | Reserved fuel buffer (miles) |
-| `LOOKAHEAD_MILES` | 200 | Lookahead window for price comparison |
-| `MAX_DETOUR_MILES` | 5 | Maximum station detour distance |
-| `CORRIDOR_BUFFER_MILES` | 50 | PostGIS ST_DWithin corridor width (miles) |
-| `MIN_DESTINATION_RESERVE_GALLONS` | 5 | Minimum fuel remaining at destination |
-| `GOOGLE_API_KEY` | — | Google Maps API key |
-| `CACHE_TTL['OPTIMIZATION']` | 3600 | Optimization cache TTL (seconds) |
-| `CACHE_TTL['ROUTE_GEOMETRY']` | 86400 | Route cache TTL (seconds) |
-| `CACHE_TTL['GEOCODE']` | 604800 | Geocode cache TTL (seconds) |
-| `THROTTLE_RATE['anon']` | 1000/hour | DRF AnonRateThrottle limit |
-| `_PRICE_VERSION_CACHE_TTL` | 30s | Price version in-process cache TTL |
-| `REDIS_PRICE_VERSION_TTL` | 60s | Price version Redis sync key TTL |
-| `CHECK_INTERVAL` | 10 | GeometryCache Redis version check interval (get calls) |
-
----
-
-## Engineering Tradeoffs
-
-### 1. Greedy + Lookahead vs Dynamic Programming
-
-**Chosen**: Greedy + 200-mile lookahead. **Rejected**: Full DP (O(n²)).
-
-The 500-mile tank range naturally bounds the reachable set of stations from any position. A full DP over all stations along a route (often 200+) provides at most 2-3% improvement over greedy lookahead, at 20-50x computation cost. The lookahead window of 200 miles captures meaningful price differences without exploring the full state space. This is a textbook example of exploiting domain constraints (truck fuel range) to reduce algorithmic complexity.
-
-### 2. Two Route Alternatives
-
-**Chosen**: 2 alternatives. **Rejected**: 3+ or single-route.
-
-Google Directions API returns up to 3 routes with `alternatives=true`. The third route is typically a minor variant of the first two (e.g., same highways with different local roads). Two routes capture meaningful alternatives (e.g., I-40 vs I-80 cross-country) while avoiding the 50% compute overhead of evaluating a third route that rarely wins selection.
-
-### 3. Redis-First Caching
-
-**Chosen**: Redis for optimization and geocode cache. **Rejected**: PostgreSQL-only caching.
-
-Redis provides sub-millisecond cache reads vs ~5ms PostgreSQL queries. For optimization results that can be ~5KB of JSON, Redis avoids serialization overhead and DB connection pool contention. PostgreSQL RouteCache is used only for route geometry (which naturally benefits from PostGIS spatial types).
-
-### 4. Optimization-Level Caching (not stop-level)
-
-**Chosen**: Cache the full optimization result. **Rejected**: Cache individual fuel stops or station prices.
-
-Caching the final result means a cache hit returns instantly without any recomputation. Stop-level caching would still require the selection algorithm to re-run, and station prices change together (versioned), making partial caching ineffective. The 1-hour TTL balances freshness with cache-hit ratio.
-
-### 5. Geometry Cache (In-Process LRU)
-
-**Chosen**: In-process Python dict LRU. **Rejected**: Redis-based geometry cache.
-
-Route geometry is used intensively during a single request (decoding, cumulative distance, corridor sampling) but rarely reused across requests (different routes have different polylines). An in-process LRU avoids Redis serialization overhead for large polyline coordinate arrays while capturing reuse within the same request or consecutive similar requests. 200 entries at ~10KB each fits comfortably in process memory.
-
-### 6. Request Coalescing (Redis Locks)
-
-**Chosen**: Distributed lock with SET NX. **Rejected**: Optimistic retry, per-worker locking.
-
-When two clients request the same uncached route simultaneously, the lock ensures only one calls Google APIs while the other waits (up to 5s). Without this, both requests trigger Directions API calls. The lock key is separate from the cache key, and the 30-second lock TTL handles slow Google responses gracefully.
-
-### 7. Corridor Station Cache (Redis)
-
-**Chosen**: Cache corridor-filtered station OPIS IDs in Redis. **Rejected**: Recompute corridor filter per route request.
-
-The corridor filter runs O(stations × samples) distance calculations. For 1000 candidate stations and 50 polyline samples, that's 50,000 haversine computations (~25ms worth). Stations change location rarely, so caching the filtered OPIS IDs for 1 hour eliminates this cost for repeat requests to the same corridor.
-
-### 8. Short-Route Fast Path
-
-**Chosen**: Skip all station logic for routes < 500 miles. **Rejected**: Always run optimization.
-
-A full tank (50 gal × 10 MPG = 500 miles) covers any sub-500-mile trip. Station lookup and optimization for these routes produces exactly zero stops while wasting ~100-200ms of computation. The fast path returns immediately after route fetch, using the same optimized response structure with empty fuel stops.
-
-### 9. Bounded Lookahead (200 miles)
-
-**Chosen**: 200-mile lookahead window. **Rejected**: Unlimited lookahead, fixed station-count lookahead.
-
-200 miles represents ~4-5 hours of driving at highway speeds — a practical range for finding alternative fuel stations. Unlimited lookahead would evaluate all downstream stations, approaching O(n²) in the worst case. A fixed-count lookahead (e.g., "next 10 stations") might miss price differences at 180 miles when the tank range is 500 miles.
-
-### 10. Detour Filtering (2x Penalty)
-
-**Chosen**: 5-mile max detour with 2x penalty in effective distance. **Rejected**: Hard cutoff at 5 miles, no penalty.
-
-A hard "must be within 5 miles of route" would include stations at 5 miles while treating 5.1 miles as impossible. The 2x penalty makes detours costly in the optimization math: a 5-mile detour adds 10 miles of effective distance, which costs 1 gallon of fuel. This naturally disincentivizes detours without an arbitrary cutoff.
-
-### 11. Cache Key Normalization
-
-**Chosen**: Normalize inputs before cache key computation. **Rejected**: Use raw input strings.
-
-"Los Angeles, CA" and "los angeles, ca " should produce the same cache key. Address normalization (lowercase + trim + state expansion) and coordinate normalization (4 decimal places ≈ 11m precision) ensure cache hits even with slightly different input formatting. This increases the effective cache hit rate by ~15-20% for address-based requests.
-
-### 12. Haversine Over Geodesic
-
-**Chosen**: Haversine formula. **Rejected**: Vincenty/geodesic (geopy).
-
-Haversine distance has <0.5% error relative to the WGS-84 ellipsoid for distances and latitudes common in US driving routes. At ~0.5μs per call vs ~50μs for geopy's geodesic, it's 100x faster. For station proximity checks where "within 50 miles" is the threshold (not "exactly 47.3 miles"), this error is irrelevant.
-
-### 14. PostGIS Corridor Pushdown
-
-**Chosen**: PostGIS `ST_DWithin` with GIST index. **Rejected**: Python haversine corridor loop.
-
-The original design avoided PostGIS based on the premise that "Python haversine against 50 sampled polyline points is faster than a spatial SQL round-trip." This is true for small station counts (<100) but breaks down at scale. With 5141 stations in the database, the bbox pre-filter still returns ~5000 candidates per route, requiring 5000 × 50 = 250,000 haversine calculations (~125ms). A single `ST_DWithin` query with a GIST index on `location_point` reduces this to ~5ms, scaling sub-linearly with station density.
-
-The PointField uses `geography=True` (meters-based distance on WGS-84 spheroid), so `D(mi=50)` automatically converts to meters. The GIST index enables index-assisted `ST_DWithin` — PostGIS reads only the geometry index entries within range rather than scanning the full table.
-
-### 15. Distributed Cache Consistency (Multi-Worker)
-
-**Chosen**: Redis-backed version sync with in-process LRU. **Rejected**: Exclusively in-process or exclusively Redis caches.
-
-In a multi-worker Gunicorn deployment, each worker maintains its own in-process caches (price version, geometry LRU). Without synchronization, when a price update changes the active PriceVersion, workers may serve stale optimizations for up to 30 seconds (the in-process cache TTL).
-
-Two Redis sync mechanisms mitigate this:
-
-| Mechanism | What It Syncs | Cost |
-|-----------|--------------|------|
-| `cache.set('price_version:active', id, 60)` | Price version ID written to Redis after DB fetch | One Redis SET per 30s per worker |
-| `cache.get('price_version:active')` | Checked before DB query on cache miss | One Redis GET per 30s per worker |
-| `geometry_cache:version` | Clears in-process LRU when routes are re-processed | One Redis GET per 10th LRU access |
-
-### 16. Rate Limiting
-
-**Chosen**: DRF `AnonRateThrottle` at 1000 requests/hour. **Rejected**: No rate limiting, per-IP limiting.
-
-Without rate limiting, a misbehaving client or accidental infinite loop could exhaust Google API quota. DRF's built-in `AnonRateThrottle` (1000 requests/hour) uses the `CACHES` backend (Redis in production, local memory in development) with no additional infrastructure. The throttle scope is `anon`, and 429 responses include a `Retry-After` header.
-
-### 17. Observability (Health Endpoint)
-
-**Chosen**: Dedicated `/route/health/` endpoint returning system status. **Rejected**: Third-party monitoring, log-based health.
-
-The health endpoint (`fuel_routing/views.py`) provides:
-- **Database connectivity**: verifies `FuelStation` table is accessible and reports active station count + price version
-- **Cache connectivity**: read/write check against the configured cache backend
-- **Request metrics**: total requests processed and optimization cache hit count (tracked via module-level counters)
-
-This enables simple load-balancer health checks (returning `status: degraded` instead of 500 when dependencies fail) and at-a-glance diagnostics without external monitoring tools.
-
-### 18. Batch Price Fetch
-
-**Chosen**: Load all active prices into a dict once. **Rejected**: per-station price queries.
-
-Loading 50,000 prices into a Python dict takes ~50ms and ~5MB memory. Per-station price queries would add N+1 database round-trips (~2ms each). Even for 200 candidate stations, that's 400ms vs 50ms. The dict is shared across all route alternatives during a single request.
-
----
-
-## Scalability Analysis
-
-| Dimension | Current Capacity | Bottleneck | Mitigation |
-|-----------|-----------------|------------|------------|
-| Requests/sec | ~50 (single instance) | Google API rate limits | Caching reduces Google dependency by ~95% |
-| Concurrent routes | Unlimited (coalesced) | Redis connection pool | Request coalescing ensures 1 Google call per unique route |
-| Station count | 100k+ | None (indexed queries) | Bounding box + price filter limits results |
-| Route distance | Unlimited | Google API response size | Polylines typically <100KB for cross-country |
-| Cache memory | ~500MB Redis budget | Optimization cache for 100k+ unique routes | 1h TTL auto-evicts via Redis LRU |
-| DB size | ~50k stations | Negligible | Single table with btree index on lat/lng |
 
 ---
 
 ## Setup
 
 ```bash
-# Clone and enter project
-git clone <repo>
-cd spotter-ai-assignment
-
-# Create virtual environment
+# Create virtual environment and install dependencies
 python -m venv venv
 source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
 
 # Database setup (PostgreSQL with PostGIS required)
@@ -704,84 +207,46 @@ export GOOGLE_MAPS_API_KEY=your_key_here
 gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4
 ```
 
+---
+
 ## Testing
 
+The test suite sends requests to a running server and validates every field in the response. It covers 180 routes across short trips (under 500 miles), medium trips, long trips, and coast-to-coast routes.
+
 ```bash
-# Run 180-test validation suite
+# Start the server first, then run tests
 python test_all.py
-
-# Analyze a single response
-curl -s -X POST http://localhost:8000/route/fuel-optimization/ \
-  -H 'Content-Type: application/json' \
-  -d '{"start": "Los Angeles, CA", "finish": "New York, NY"}' | python analyze_response.py
 ```
 
-The test suite covers 180 routes across 4 distance categories:
-
-| Category | Range | Tests | What It Validates |
-|----------|-------|-------|-------------------|
-| Short | 0-500 mi | 50 | Fast-path optimization, no-stop correctness |
-| Medium | 500-1500 mi | 50 | Single/multi-stop optimization |
-| Long | 1500-3500+ mi | 50 | Multi-stop scenarios, corridor filtering |
-| Coast-to-coast | 2500-3500+ mi | 30 | Extreme-range edge cases, fuel accounting |
-
-Each test checks: response time, cost consistency, fuel accounting, stop math, cross-field accuracy, and cache behavior.
-
-### Test Coverage Matrix
-
-| Check | What It Validates |
-|-------|-------------------|
-| Response time < 5s | No slow responses |
-| _cache_hit correctness | Cache behaves as expected |
-| Fuel stop progression | Monotonically increasing distance |
-| Total fuel accounting | start + purchased - consumed = remaining |
-| Cost math | price × gallons = cost (within $0.01) |
-| Minimum purchase | No stop < 5 gallons |
-| Route distance consistency | Station distances ≤ route total |
-| Short route fast path | No stops for < 500mi routes |
+Each test checks that the response includes all required fields, that the fuel accounting adds up (starting fuel plus purchased fuel minus consumed fuel equals remaining fuel), that stop costs are calculated correctly (price times gallons equals cost), and that distances are consistent.
 
 ---
 
-## Project Structure
+## Configuration
 
-```
-fuel_routing/
-├── api.py                # REST API endpoint (DRF ViewSet)
-├── views.py              # Health check and system diagnostics endpoints
-├── engine.py             # Orchestration: geocode → route → stations → optimize → select
-├── cache_service.py      # Unified optimization cache with key normalization
-├── cache_utils.py        # GeometryCache LRU, CorridorStationCache Redis, locks, key gen
-├── geocoding.py          # Google Geocoding API client with parallel execution
-├── routing.py            # Google Directions API client with multi-route caching
-├── stations.py           # Fuel station query with corridor filtering
-├── optimizer.py          # Greedy + 200-mile lookahead optimization engine
-├── route_selector.py     # Best-route selection by cost-per-mile
-├── route_geometry.py     # Corridor validation, stop sequence validation
-├── ultra_cache.py        # Legacy cache shim (backward compatibility)
-├── constants.py          # Vehicle parameters, API configuration
-├── models.py             # Django ORM models (FuelStation, FuelPrice, RouteCache, PriceVersion)
-├── serializers.py        # DRF request/response serializers
-├── preprocessing.py      # CSV data preprocessing pipeline
-├── apps.py               # Django app config
-├── management/commands/
-│   └── preprocess_fuel_data.py
-└── tests/
-    └── test_all.py       # 180-route validation suite
-```
+Key parameters that control the vehicle model and optimization behavior are in `constants.py`:
+
+- Vehicle fuel efficiency (miles per gallon)
+- Fuel tank capacity in gallons
+- Reserve fuel buffer in miles
+- Maximum detour distance in miles
+- Minimum fuel purchase amount in gallons
+- Corridor buffer width for station queries
+
+These are set through Django settings and can be adjusted per deployment.
 
 ---
 
-## Changelog
+## Design Notes
 
-### Latest Improvements
+A few decisions that came up during development:
 
-| Change | Description |
-|--------|-------------|
-| **Decimal costing** | Stop costs computed via Decimal arithmetic (no float rounding); `price × gallons = cost` holds exactly |
-| **Route comparison fix** | Primary sort key changed from `cost_per_mile` to `total_fuel_cost` — absolute cheapest route wins |
-| **Infeasible route costing** | Routes with insufficient station coverage use distance-based cost estimate for fair comparison |
-| **Corridor cache key fix** | Polyline content hash added to `CorridorStationCache` key to prevent cross-route collisions |
-| **Response serializer completeness** | Added `status`, `request_id`, `is_optimal`, `reason` to API response (were silently dropped) |
-| **Price precision preserved** | `fuel_price_per_gallon` now shows full DB precision (3dp) — no artificial rounding to 2dp |
-| **Read-only transaction removed** | Removed unnecessary `transaction.atomic()` wrapper around PostGIS corridor query |
-| **Route comparison consistency** | Non-selected routes now display their actual optimizer-computed cost, not a recomputed value |
+The optimization algorithm uses a greedy approach rather than dynamic programming. The tank range naturally limits how far ahead you need to look, and recomputing at every stop catches cases where the greedy choice wasnt ideal. This keeps the computation fast while still producing good results.
+
+The API always evaluates two route alternatives from Google Directions and picks the cheaper one. Three routes were considered but the third was usually a minor variation of the first two and added compute time without meaningful benefit.
+
+Redis is used for most caching because sub-millisecond reads matter when the system is handling many requests. PostgreSQL RouteCache exists only for route geometry that benefits from PostGIS spatial types.
+
+The station corridor filter uses PostGIS spatial queries with a GIST index. An earlier version did all filtering in Python with haversine calculations, but the spatial SQL approach is significantly faster with thousands of stations to evaluate.
+
+Route and geocode inputs are normalized before computing cache keys. This means Los Angeles, CA and los angeles, ca produce the same key and share a cached result.

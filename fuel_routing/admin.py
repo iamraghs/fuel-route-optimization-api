@@ -29,9 +29,10 @@ class FuelStationAdmin(admin.ModelAdmin):
     
     # Readonly fields (computed/immutable)
     readonly_fields = (
-        'created_at', 'updated_at', 'coordinates_tuple',
-        'formatted_full_address', 'geocode_status_detail',
-        'price_status_detail', 'brand_extracted'
+        'created_at', 'updated_at', 'last_verified_at',
+        'coordinates_tuple', 'formatted_full_address',
+        'geocode_status_detail', 'price_status_detail',
+        'brand_extracted'
     )
     
     # Organize fields into logical groups

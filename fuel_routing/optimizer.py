@@ -1,4 +1,4 @@
-"""Fuel optimization engine implementing Greedy + Lookahead algorithm."""
+"""Fuel optimization engine implementing Range-Aware Greedy algorithm."""
 import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -9,7 +9,7 @@ from django.db.models import Avg
 import polyline
 
 from .constants import (
-    LOOKAHEAD_MILES, MAX_DETOUR_MILES, VEHICLE_MPG, VEHICLE_RESERVE_MILES,
+    MAX_DETOUR_MILES, VEHICLE_MPG, VEHICLE_RESERVE_MILES,
     VEHICLE_TANK, VEHICLE_MAX_RANGE
 )
 from .geocoding import Location, _fast_distance_miles
@@ -68,7 +68,7 @@ def get_cached_avg_price(price_version_id: int, force: bool = False) -> float:
 
 
 class FuelOptimizer:
-    """Greedy + Lookahead fuel stop optimization algorithm."""
+    """Range-Aware Greedy fuel stop optimization algorithm with full-range lookahead."""
 
     @staticmethod
     def precompute_route_distances(
@@ -132,7 +132,7 @@ class FuelOptimizer:
         start_location: Location,
         end_location: Location
     ) -> List[FuelStopDetail]:
-        """Calculate optimal fuel stops using Greedy + Route-Aware Lookahead algorithm."""
+        """Calculate optimal fuel stops using Range-Aware Greedy algorithm."""
         logger.info(f"Optimizing fuel stops for {route.route_id} ({route.distance_miles:.1f} miles)")
 
         # Precompute route distances
@@ -165,6 +165,19 @@ class FuelOptimizer:
             station_route_data[station['opis_id']] = {
                 'snapped_distance': snapped_dist,
                 'detour_miles': detour,
+            }
+
+        # Full station index for range-aware cheaper-ahead lookups.
+        # Unlike `candidates` (filtered to current-position reachable),
+        # this includes ALL stations that become reachable after filling up.
+        _station_index = {}
+        for station in available_stations:
+            oid = station['opis_id']
+            sr = station_route_data.get(oid, {})
+            _station_index[oid] = {
+                'distance': sr.get('snapped_distance', 0.0),
+                'price': Decimal(str(station['price_per_gallon'])),
+                'name': station.get('name', ''),
             }
 
         stops = []
@@ -246,40 +259,94 @@ class FuelOptimizer:
                 )
                 break
 
-            # Greedy + Lookahead selection (sorted by DISTANCE, not price)
+            # Range-Aware Greedy selection
             candidates.sort(key=lambda x: x['distance_from_start'])
 
             selected = None
             selected_strategy = None
             target_cheaper = None
 
+            # Effective ranges for decision making
+            current_effective_range = current_fuel * VEHICLE_MPG - VEHICLE_RESERVE_MILES
+            full_tank_range = float(VEHICLE_TANK) * VEHICLE_MPG
+            full_tank_effective_range = full_tank_range - VEHICLE_RESERVE_MILES
+
             for candidate in candidates:
                 station_distance = candidate['distance_from_start']
-                lookahead_limit = station_distance + LOOKAHEAD_MILES
+                fuel_at_arrival = candidate['fuel_at_arrival']
+                price = candidate['price']
 
-                cheaper_ahead = None
-                for other in candidates:
-                    if other['distance_from_start'] > station_distance and \
-                       other['distance_from_start'] <= lookahead_limit:
-                        if other['price'] < candidate['price']:
-                            if cheaper_ahead is None or other['price'] < cheaper_ahead['price']:
-                                cheaper_ahead = other
-
-                if cheaper_ahead:
-                    if cheaper_ahead['fuel_at_arrival'] >= 0:
+                # --- CASE 1: Destination reachable from here after filling ---
+                if route.distance_miles - station_distance <= full_tank_range:
+                    # Check if a cheaper station is reachable from current position
+                    # before committing — if so, skip to it for a better price
+                    cheaper_before_dest = any(
+                        other['price'] < price
+                        for other in candidates
+                        if other['distance_from_start'] > station_distance
+                        and other['distance_from_start'] - current_position <= current_effective_range
+                    )
+                    if cheaper_before_dest:
                         logger.debug(
-                            f"Skipping {candidate['station']['name']} (@{candidate['price']:.3f}) - "
-                            f"can reach cheaper {cheaper_ahead['station']['name']} (@{cheaper_ahead['price']:.3f}) directly"
+                            f"Skipping {candidate['station']['name']} (@{price:.3f}) for last stop - "
+                            f"cheaper station ahead reachable directly"
                         )
                         continue
 
                     selected = candidate
+                    selected_strategy = 'to_destination'
+                    logger.debug(
+                        f"Last stop at {candidate['station']['name']} (@{price:.3f}) - "
+                        f"destination reachable with fill-up"
+                    )
+                    break
+
+                # --- Look for cheaper stations reachable from here ---
+                cheaper_ahead = None
+                for oid, info in _station_index.items():
+                    if oid in visited_stations:
+                        continue
+                    if info['distance'] <= station_distance:
+                        continue
+                    if info['distance'] > station_distance + full_tank_effective_range:
+                        continue
+                    if info['price'] < price:
+                        if cheaper_ahead is None or info['price'] < cheaper_ahead['price']:
+                            cheaper_ahead = {
+                                'distance_from_start': info['distance'],
+                                'price': info['price'],
+                                'station': {'name': info['name']},
+                                'opis_id': oid,
+                            }
+
+                if cheaper_ahead:
+                    # Can we skip this station and reach the cheaper one directly?
+                    if cheaper_ahead['distance_from_start'] - current_position <= current_effective_range:
+                        logger.debug(
+                            f"Skipping {candidate['station']['name']} (@{price:.3f}) - "
+                            f"can reach cheaper {cheaper_ahead['station']['name']} "
+                            f"(@{cheaper_ahead['price']:.3f}) directly"
+                        )
+                        continue
+
+                    # --- CASE 2: Partial fill to reach cheaper station ---
+                    selected = candidate
                     selected_strategy = 'partial'
                     target_cheaper = cheaper_ahead
+                    logger.debug(
+                        f"Partial fill at {candidate['station']['name']} (@{price:.3f}) - "
+                        f"targeting cheaper {cheaper_ahead['station']['name']} "
+                        f"(@{cheaper_ahead['price']:.3f})"
+                    )
                     break
                 else:
+                    # --- CASE 3: No cheaper ahead — fill for max range flexibility ---
                     selected = candidate
                     selected_strategy = 'fill'
+                    logger.debug(
+                        f"Fill at {candidate['station']['name']} (@{price:.3f}) - "
+                        f"no cheaper station within {full_tank_effective_range:.0f}mi range"
+                    )
                     break
 
             if selected is None:
@@ -293,9 +360,16 @@ class FuelOptimizer:
             # Calculate refuel amount based on strategy
             fuel_at_arrival = selected['fuel_at_arrival']
 
-            if selected_strategy == 'partial' and target_cheaper:
+            if selected_strategy == 'to_destination':
+                dest_distance = route.distance_miles - selected['distance_from_start']
+                fuel_needed = (dest_distance + VEHICLE_RESERVE_MILES) / VEHICLE_MPG
+                fuel_to_buy = max(0.0, min(
+                    fuel_needed - fuel_at_arrival,
+                    float(VEHICLE_TANK) - fuel_at_arrival
+                ))
+            elif selected_strategy == 'partial' and target_cheaper:
                 dist_to_cheaper = target_cheaper['distance_from_start'] - selected['distance_from_start']
-                fuel_needed_to_cheaper = (dist_to_cheaper + 20.0) / VEHICLE_MPG
+                fuel_needed_to_cheaper = (dist_to_cheaper + 20.0 + VEHICLE_RESERVE_MILES) / VEHICLE_MPG
                 fuel_to_buy = max(0.0, min(
                     fuel_needed_to_cheaper - fuel_at_arrival,
                     float(VEHICLE_TANK) - fuel_at_arrival
@@ -305,12 +379,27 @@ class FuelOptimizer:
 
             # Skip micro-purchases (< 5 gallons)
             if fuel_to_buy < 5.0:
-                logger.debug(
-                    f"Skip micro-refuel at {selected['station']['name']}: "
-                    f"would only buy {fuel_to_buy:.1f}gal (< 5gal minimum)"
+                # If skipping would strand us (no other reachable stations ahead),
+                # override to fill instead — making progress always beats no progress
+                fill_amount = max(0.0, float(VEHICLE_TANK) - fuel_at_arrival)
+                has_other_stations = any(
+                    c['station']['opis_id'] != selected['station']['opis_id']
+                    for c in candidates
                 )
-                visited_stations.add(selected['station']['opis_id'])
-                continue
+                if not has_other_stations and fill_amount >= 5.0:
+                    fuel_to_buy = fill_amount
+                    selected_strategy = 'fill'
+                    logger.debug(
+                        f"Override to fill at {selected['station']['name']}: "
+                        f"micro-refuel ({fill_amount:.1f}gal) would strand route"
+                    )
+                else:
+                    logger.debug(
+                        f"Skip micro-refuel at {selected['station']['name']}: "
+                        f"would only buy {fuel_to_buy:.1f}gal (< 5gal minimum)"
+                    )
+                    visited_stations.add(selected['station']['opis_id'])
+                    continue
 
             # Skip stops too close after a fill-up
             distance_from_last = selected['distance_from_start'] - current_position

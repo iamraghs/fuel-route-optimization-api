@@ -6,6 +6,7 @@ import time
 import sys
 from datetime import datetime
 
+
 # ─── SHORT DISTANCE (0–500 Miles) ─────────────────────────────────
 SHORT = [
     {"start": "Miami, FL", "finish": "Orlando, FL"},
