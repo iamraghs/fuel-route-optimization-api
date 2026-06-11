@@ -4,6 +4,7 @@ from django.urls import path
 from fuel_routing.api import optimize_fuel_route
 from fuel_routing.views import health_check
 
+
 urlpatterns = [
 
     path('admin/', admin.site.urls),
