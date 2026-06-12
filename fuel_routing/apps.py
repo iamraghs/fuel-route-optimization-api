@@ -13,3 +13,6 @@ class FuelRoutingConfig(AppConfig):
         import logging
         logger = logging.getLogger(__name__)
         logger.debug("Fuel Routing app is ready")
+
+
+

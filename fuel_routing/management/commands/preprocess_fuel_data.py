@@ -278,3 +278,5 @@ class Command(BaseCommand):
         except Exception as e:
             logger.error(f"Failed to generate report: {str(e)}")
             raise
+
+

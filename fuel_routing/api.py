@@ -5,9 +5,6 @@ from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from django.utils import timezone
-from django.views.decorators.cache import cache_page
-from django.utils.decorators import decorator_from_middleware_with_args
-from django.middleware.cache import UpdateCacheMiddleware
 
 from .serializers import (
     FuelOptimizationRequestSerializer,

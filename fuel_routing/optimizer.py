@@ -2,7 +2,7 @@
 import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from django.db.models import Avg
 
@@ -13,7 +13,7 @@ from .constants import (
     VEHICLE_TANK, VEHICLE_MAX_RANGE
 )
 from .geocoding import Location, _fast_distance_miles
-from .models import FuelPrice, PriceVersion
+from .models import FuelPrice
 from .routing import RouteAlternative
 from .cache_utils import GeometryCache
 

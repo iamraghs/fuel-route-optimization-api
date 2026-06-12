@@ -12,6 +12,7 @@ from .models import PriceVersion, FuelStation
 logger = logging.getLogger(__name__)
 
 
+
 def health_check(request):
     """Lightweight health check returning system status."""
     start = time.time()

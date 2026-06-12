@@ -17,7 +17,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict
-from typing import Optional, Dict, Any, Callable, TypeVar, List, Tuple
+from typing import Optional, Any, Callable, TypeVar, List, Tuple
 
 from django.core.cache import cache
 

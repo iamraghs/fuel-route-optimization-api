@@ -208,3 +208,5 @@ class FuelOptimizationResponseSerializer(serializers.Serializer):
     route_comparison = RouteComparisonSerializer(many=True)
     fuel_stops = FuelStopSerializer(many=True)
     trip_summary = TripSummarySerializer()
+
+

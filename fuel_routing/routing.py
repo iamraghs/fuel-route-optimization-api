@@ -1,10 +1,9 @@
 """Routing service using Google Directions API with caching and request coalescing."""
 import logging
-import time
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import timedelta
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 from django.contrib.gis.geos import LineString
@@ -14,7 +13,7 @@ from django.utils import timezone
 import polyline
 
 from .cache_utils import EnhancedCacheKeyGenerator, RequestLockManager
-from .constants import GOOGLE_API_KEY, GOOGLE_ROUTES_ENDPOINT, CACHE_TTL_ROUTE
+from .constants import GOOGLE_API_KEY, CACHE_TTL_ROUTE
 from .geocoding import Location
 from .models import RouteCache
 
@@ -173,7 +172,7 @@ class RoutingService:
                 try:
                     RouteCache.objects.filter(
                         cache_key=base_key, is_valid=True
-                    ).update(access_count=models.F('access_count') + 1)
+                    ).update(access_count=F('access_count') + 1)
                 except Exception:
                     pass
                 return [

@@ -1,7 +1,7 @@
 """Route comparison and selection by total fuel cost efficiency."""
 import logging
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from .optimizer import FuelStopDetail
 from .routing import RouteAlternative

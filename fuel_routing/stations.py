@@ -1,6 +1,6 @@
 """Fuel station query service with polyline corridor filtering."""
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from .constants import CORRIDOR_BUFFER_MILES
 from .geocoding import _fast_distance_miles

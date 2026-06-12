@@ -4,32 +4,25 @@ import logging
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
-from django.conf import settings
 from django.contrib.gis.geos import LineString
 from django.contrib.gis.measure import D
 from django.core.cache import cache
-from django.db import transaction
-from django.db.models import Avg
-from django.utils import timezone
 
 from .cache_utils import (
-    EnhancedCacheKeyGenerator, RequestLockManager, RouteNormalizer,
-    GeometryCache, CorridorStationCache,
+    CorridorStationCache,
 )
 from .cache_service import get_cached_optimization, set_cached_optimization
 from .constants import (
     GOOGLE_API_KEY, VEHICLE_MAX_RANGE, VEHICLE_MPG, VEHICLE_TANK,
-    LOOKAHEAD_MILES, MAX_DETOUR_MILES, MIN_DESTINATION_RESERVE_GALLONS,
+    MIN_DESTINATION_RESERVE_GALLONS,
     CORRIDOR_BUFFER_MILES,
 )
 from .geocoding import GeocodingService, Location
 from .models import FuelPrice, FuelStation, PriceVersion
-from .optimizer import FuelOptimizer, FuelStopDetail, get_cached_avg_price
+from .optimizer import FuelOptimizer, get_cached_avg_price
 from .route_geometry import RouteGeometryValidator, decode_route_to_coordinates
 from .route_selector import RouteComparator
 from .routing import RoutingService
@@ -725,7 +718,6 @@ class FuelRouteOptimizationEngine:
             'fuel_stops': fuel_stops_response,
             'trip_summary': {
                 'total_distance_miles': round(selected_route.distance_miles, 1),
-                'total_fuel_consumed_gallons': round(actual_fuel_consumed, 1),
                 'total_fuel_cost': (
                     estimated_fuel_cost if infeasible else response_total_cost
                 ),

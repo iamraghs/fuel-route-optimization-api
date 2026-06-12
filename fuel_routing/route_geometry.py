@@ -297,3 +297,4 @@ class RouteGeometryValidator:
                 return filtered_stops
         
         return valid_stops
+

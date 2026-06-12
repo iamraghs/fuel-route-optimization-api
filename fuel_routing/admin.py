@@ -462,3 +462,6 @@ class GeocodeFailureAdmin(admin.ModelAdmin):
         return f"{obj.city}, {obj.state}"
     
     city_state.short_description = "Location"
+
+
+

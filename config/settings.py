@@ -3,7 +3,6 @@ Django settings for Spotter AI Fuel Routing API.
 Production-grade configuration for optimal performance.
 """
 
-import os
 from pathlib import Path
 from decouple import config
 

@@ -37,9 +37,8 @@ import csv
 import logging
 import re
 from decimal import Decimal
-from typing import List, Dict, Tuple, Optional, Set
+from typing import List, Dict, Tuple
 from datetime import datetime
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 

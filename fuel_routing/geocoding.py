@@ -1,11 +1,10 @@
 """Geocoding service using Google Geocoding API with caching and request coalescing."""
 import logging
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import timedelta
+from typing import Optional, Tuple
 
 import requests
-from django.conf import settings
 from django.core.cache import cache
 from django.utils import timezone
 
