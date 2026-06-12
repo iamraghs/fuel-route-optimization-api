@@ -21,3 +21,5 @@ class Migration(migrations.Migration):
             field=models.DecimalField(decimal_places=6, help_text='Longitude (6 decimals = 0.1m precision)', max_digits=10),
         ),
     ]
+
+

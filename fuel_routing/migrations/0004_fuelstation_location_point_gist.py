@@ -6,6 +6,7 @@ from django.contrib.gis.geos import Point
 from django.db import migrations, models
 
 
+
 def populate_location_point(apps, schema_editor):
     """Backfill location_point from existing latitude/longitude fields."""
     FuelStation = apps.get_model('fuel_routing', 'FuelStation')

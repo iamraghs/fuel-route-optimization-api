@@ -298,3 +298,4 @@ class Migration(migrations.Migration):
             index=models.Index(condition=models.Q(('is_valid', True)), fields=['total_fuel_cost'], name='idx_opt_cost'),
         ),
     ]
+

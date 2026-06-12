@@ -4,6 +4,7 @@ import django.core.validators
 from django.db import migrations, models
 
 
+
 class Migration(migrations.Migration):
 
     initial = True
