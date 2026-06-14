@@ -331,10 +331,18 @@ class FuelRouteOptimizationEngine:
                 sw = bounds.get('sw', {})
                 ne = bounds.get('ne', {})
 
-                sw_lat = sw.get('lat') or sw.get('latitude')
-                sw_lon = sw.get('lng') or sw.get('longitude')
-                ne_lat = ne.get('lat') or ne.get('latitude')
-                ne_lon = ne.get('lng') or ne.get('longitude')
+                sw_lat = sw.get('lat')
+                if sw_lat is None:
+                    sw_lat = sw.get('latitude')
+                sw_lon = sw.get('lng')
+                if sw_lon is None:
+                    sw_lon = sw.get('longitude')
+                ne_lat = ne.get('lat')
+                if ne_lat is None:
+                    ne_lat = ne.get('latitude')
+                ne_lon = ne.get('lng')
+                if ne_lon is None:
+                    ne_lon = ne.get('longitude')
 
                 if all([sw_lat is not None, sw_lon is not None,
                         ne_lat is not None, ne_lon is not None]):
@@ -422,10 +430,18 @@ class FuelRouteOptimizationEngine:
             try:
                 bounds = route.bounds if isinstance(route.bounds, dict) else {}
                 sw, ne = bounds.get('sw', {}), bounds.get('ne', {})
-                slat = sw.get('lat') or sw.get('latitude')
-                slon = sw.get('lng') or sw.get('longitude')
-                nelat = ne.get('lat') or ne.get('latitude')
-                nelon = ne.get('lng') or ne.get('longitude')
+                slat = sw.get('lat')
+                if slat is None:
+                    slat = sw.get('latitude')
+                slon = sw.get('lng')
+                if slon is None:
+                    slon = sw.get('longitude')
+                nelat = ne.get('lat')
+                if nelat is None:
+                    nelat = ne.get('latitude')
+                nelon = ne.get('lng')
+                if nelon is None:
+                    nelon = ne.get('longitude')
                 if all(v is not None for v in [slat, slon, nelat, nelon]):
                     lat_pad, lon_pad = 3.0, 3.0
                     lat_min, lat_max = min(slat, nelat), max(slat, nelat)
@@ -784,12 +800,11 @@ class FuelRouteOptimizationEngine:
     ) -> Optional[Location]:
         """Resolve location from string address or lat/lng dict."""
         if isinstance(location_input, dict):
-            return Location(
-                latitude=(
-                    location_input.get('lat') or location_input.get('latitude')
-                ),
-                longitude=(
-                    location_input.get('lng') or location_input.get('longitude')
-                ),
-            )
+            lat = location_input.get('lat')
+            if lat is None:
+                lat = location_input.get('latitude')
+            lon = location_input.get('lng')
+            if lon is None:
+                lon = location_input.get('longitude')
+            return Location(latitude=lat, longitude=lon)
         return GeocodingService.geocode(location_input)

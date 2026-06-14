@@ -36,7 +36,6 @@ class GeocodingService:
     @staticmethod
     def geocode(address: str) -> Optional[Location]:
         """Geocode address to coordinates with caching and request coalescing."""
-        normalized_address = RouteNormalizer.normalize_address(address)
         cache_key = EnhancedCacheKeyGenerator.geocode_key(address)
         lock_key = EnhancedCacheKeyGenerator.lock_key(cache_key)
 
