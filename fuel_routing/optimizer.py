@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Dict, List, Tuple
 
+import math
 from django.db.models import Avg
 
 import polyline
@@ -110,20 +111,119 @@ class FuelOptimizer:
     def snap_station_to_route(
         station_lat: float,
         station_lon: float,
-        sampled_coords: List[Tuple[float, float]],
-        sampled_cum_dist: List[float]
+        all_coords: List[Tuple[float, float]],
+        all_cum_dist: List[float]
     ) -> Tuple[float, float]:
-        """Snap a fuel station to the nearest point along the route polyline."""
-        min_dist = float('inf')
-        best_idx = 0
+        """Snap a fuel station to the nearest point along the route polyline.
 
-        for i, (lat, lon) in enumerate(sampled_coords):
-            d = _fast_distance_miles(lat, lon, station_lat, station_lon)
-            if d < min_dist:
-                min_dist = d
-                best_idx = i
+        Uses perpendicular cross-track distance to line segments, not nearest-point
+        approximation. This correctly handles sparse polyline coordinates where
+        stations between coordinate points were previously falsely rejected.
 
-        return sampled_cum_dist[best_idx], min_dist
+        Pre-computes segment bearings once per call for performance.
+        """
+        n = len(all_coords)
+        if n == 0:
+            return 0.0, 0.0
+        if n == 1:
+            d = _fast_distance_miles(all_coords[0][0], all_coords[0][1], station_lat, station_lon)
+            return all_cum_dist[0], d
+
+        R = 3958.8
+
+        # Pre-compute segment bearings and lengths (done once per call, shared across stations)
+        seg_bearings = []
+        seg_lengths_mi = []
+        for i in range(n - 1):
+            lat1, lon1 = all_coords[i]
+            lat2, lon2 = all_coords[i + 1]
+            seg_len = _fast_distance_miles(lat1, lon1, lat2, lon2)
+            seg_lengths_mi.append(seg_len)
+
+            y = math.sin(math.radians(lon2 - lon1)) * math.cos(math.radians(lat2))
+            x = (math.cos(math.radians(lat1)) * math.sin(math.radians(lat2)) -
+                 math.sin(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+                 math.cos(math.radians(lon2 - lon1)))
+            seg_bearings.append(math.atan2(y, x))
+
+        lat_r = math.radians(station_lat)
+        lon_r = math.radians(station_lon)
+
+        min_detour = float('inf')
+        best_cum_dist = 0.0
+
+        for i in range(n - 1):
+            lat1, lon1 = all_coords[i]
+            lat1_r = math.radians(lat1)
+            lon1_r = math.radians(lon1)
+            seg_len = seg_lengths_mi[i]
+
+            # For very short segments (<0.1mi), use endpoint distance directly
+            # to avoid bearing instability at close coordinates
+            if seg_len < 0.1:
+                d1 = _fast_distance_miles(lat1, lon1, station_lat, station_lon)
+                if d1 < min_detour:
+                    min_detour = d1
+                    best_cum_dist = all_cum_dist[i]
+                    if min_detour < 1e-10:
+                        break
+                d2 = _fast_distance_miles(lat1, lon1, station_lat, station_lon)
+                if d2 < min_detour:
+                    min_detour = d2
+                    best_cum_dist = all_cum_dist[i + 1]
+                    if min_detour < 1e-10:
+                        break
+                continue
+
+            # Haversine distance from segment start to station
+            dlat = lat_r - lat1_r
+            dlon = lon_r - lon1_r
+            a = (math.sin(dlat / 2.0) ** 2 +
+                 math.cos(lat1_r) * math.cos(lat_r) * math.sin(dlon / 2.0) ** 2)
+            d13 = R * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+
+            # Bearing from segment start to station
+            y = math.sin(lon_r - lon1_r) * math.cos(lat_r)
+            x = (math.cos(lat1_r) * math.sin(lat_r) -
+                 math.sin(lat1_r) * math.cos(lat_r) * math.cos(lon_r - lon1_r))
+            theta13 = math.atan2(y, x)
+
+            # Cross-track distance (perpendicular)
+            sin_d13_R = math.sin(d13 / R)
+            sin_theta_diff = math.sin(theta13 - seg_bearings[i])
+            dxt = math.asin(max(-1.0, min(1.0, sin_d13_R * sin_theta_diff))) * R
+
+            # Along-track distance (projection onto segment)
+            cos_d13_R = math.cos(d13 / R)
+            cos_dxt_R = math.cos(dxt / R)
+            if abs(cos_dxt_R) > 1e-12:
+                along_arg = max(-1.0, min(1.0, cos_d13_R / cos_dxt_R))
+                dt = math.acos(along_arg) * R
+            else:
+                dt = d13
+
+            # Check if projection falls within the segment
+            if dt < 0.0:
+                # Projection before segment start — use start-point distance
+                d = _fast_distance_miles(lat1, lon1, station_lat, station_lon)
+                cum = all_cum_dist[i]
+            elif dt > seg_len:
+                # Projection after segment end — use end-point distance
+                lat2, lon2 = all_coords[i + 1]
+                d = _fast_distance_miles(lat2, lon2, station_lat, station_lon)
+                cum = all_cum_dist[i + 1]
+            else:
+                # Station projects onto the segment — use perpendicular distance
+                d = abs(dxt)
+                cum = all_cum_dist[i] + dt
+
+            if d < min_detour:
+                min_detour = d
+                best_cum_dist = cum
+                if min_detour < 1e-10:
+                    break
+
+        return best_cum_dist, min_detour
 
     @staticmethod
     def calculate_fuel_stops(
@@ -140,7 +240,7 @@ class FuelOptimizer:
             FuelOptimizer.precompute_route_distances(route.polyline_encoded) \
             if route.polyline_encoded else ([], [], [], [])
 
-        has_route_data = len(sampled_coords) > 0
+        has_route_data = len(all_coords) > 0
 
         # Build snapped distance lookup
         station_route_data = {}
@@ -152,8 +252,8 @@ class FuelOptimizer:
                 snapped_dist, detour = FuelOptimizer.snap_station_to_route(
                     float(station['latitude']),
                     float(station['longitude']),
-                    sampled_coords,
-                    sampled_cum_dist
+                    all_coords,
+                    cum_distances
                 )
             else:
                 snapped_dist = _fast_distance_miles(

@@ -1,4 +1,5 @@
 """Main route + fuel optimization orchestrator."""
+import copy
 import hashlib
 import logging
 import time
@@ -139,6 +140,9 @@ class FuelRouteOptimizationEngine:
             # Check unified optimization cache first (Redis, price-version-aware)
             cached_result = get_cached_optimization(start_input, end_input, price_version=pv)
             if cached_result is not None:
+                # Deep copy to prevent in-place mutation of cached object
+                # (LocMemCache returns references; Redis serializes so this is a no-op there)
+                cached_result = copy.deepcopy(cached_result)
                 # Add per-request fields (not stored in cache)
                 elapsed_ms = int((time.time() - start_time) * 1000)
                 cached_result['optimization_time_ms'] = elapsed_ms
@@ -477,14 +481,14 @@ class FuelRouteOptimizationEngine:
 
             # Pre-snap stations to route
             if route_stations and route.polyline_encoded:
-                _, _, sampled_coords, sampled_cum_dist = \
+                all_coords, cum_distances, sampled_coords, sampled_cum_dist = \
                     FuelOptimizer.precompute_route_distances(route.polyline_encoded)
                 for station in route_stations:
                     snapped_dist, detour = FuelOptimizer.snap_station_to_route(
                         float(station['latitude']),
                         float(station['longitude']),
-                        sampled_coords,
-                        sampled_cum_dist
+                        all_coords,
+                        cum_distances
                     )
                     station['_snapped_distance'] = snapped_dist
                     station['_detour_miles'] = detour
