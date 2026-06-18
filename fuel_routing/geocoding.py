@@ -34,14 +34,14 @@ class GeocodingService:
     """Geocode addresses to coordinates with caching and request coalescing."""
 
     @staticmethod
-    def geocode(address: str) -> Optional[Location]:
+    def geocode(address: str, request_id: str = '') -> Optional[Location]:
         """Geocode address to coordinates with caching and request coalescing."""
         cache_key = EnhancedCacheKeyGenerator.geocode_key(address)
         lock_key = EnhancedCacheKeyGenerator.lock_key(cache_key)
 
         cached = cache.get(cache_key)
         if cached:
-            logger.debug(f"Geocoding cache HIT: {address}")
+            logger.debug(f"[{request_id}] Geocoding cache HIT: {address}")
             if isinstance(cached, dict):
                 return Location(**cached)
             elif isinstance(cached, Location):
@@ -49,7 +49,7 @@ class GeocodingService:
             return None
 
         def compute_geocode():
-            logger.info(f"Geocoding address: {address}")
+            logger.info(f"[{request_id}] Geocoding address: {address}")
             try:
                 response = requests.get(
                     GOOGLE_GEOCODING_ENDPOINT,
@@ -75,11 +75,11 @@ class GeocodingService:
                 )
 
                 cache.set(cache_key, asdict(location), CACHE_TTL_GEOCODE)
-                logger.info(f"Geocoded {address} -> ({location.latitude:.6f}, {location.longitude:.6f})")
+                logger.info(f"[{request_id}] Geocoded {address} -> ({location.latitude:.6f}, {location.longitude:.6f})")
                 return location
 
             except Exception as e:
-                logger.error(f"Geocoding error for '{address}': {e}")
+                logger.error(f"[{request_id}] Geocoding error for '{address}': {e}")
                 GeocodeFailure.objects.create(
                     original_address=address,
                     city=address.split(',')[0] if ',' in address else '',

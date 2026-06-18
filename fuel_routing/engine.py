@@ -178,10 +178,10 @@ class FuelRouteOptimizationEngine:
 
             # Resolve locations in parallel using module-level executor
             start_future = _geocode_executor.submit(
-                FuelRouteOptimizationEngine._resolve_location, start_input
+                FuelRouteOptimizationEngine._resolve_location, start_input, request_id
             )
             end_future = _geocode_executor.submit(
-                FuelRouteOptimizationEngine._resolve_location, end_input
+                FuelRouteOptimizationEngine._resolve_location, end_input, request_id
             )
             start_loc = start_future.result(timeout=30)
             end_loc = end_future.result(timeout=30)
@@ -190,7 +190,7 @@ class FuelRouteOptimizationEngine:
                 raise ValueError("Could not geocode start or end location")
 
             # Get routes from Google API
-            routes = RoutingService.get_routes(start_loc, end_loc, max_alternatives=2)
+            routes = RoutingService.get_routes(start_loc, end_loc, max_alternatives=2, request_id=request_id)
             if not routes:
                 raise ValueError("No routes found from Google API")
 
@@ -664,7 +664,7 @@ class FuelRouteOptimizationEngine:
         required_fuel_gallons = selected_route.distance_miles / VEHICLE_MPG
         available_fuel_gallons = VEHICLE_TANK + fuel_purchased_total
         remaining_fuel = available_fuel_gallons - required_fuel_gallons
-        route_impossible = remaining_fuel < -0.1  # tolerance for floating-point edge cases
+        route_impossible = remaining_fuel <= -0.1  # tolerance for floating-point edge cases
 
         if route_impossible:
             unreachable_cost = round(avg_price * available_fuel_gallons, 2)
@@ -883,7 +883,8 @@ class FuelRouteOptimizationEngine:
 
     @staticmethod
     def _resolve_location(
-        location_input: str | Dict[str, float]
+        location_input: str | Dict[str, float],
+        request_id: str = ''
     ) -> Optional[Location]:
         """Resolve location from string address or lat/lng dict."""
         if isinstance(location_input, dict):
@@ -894,4 +895,4 @@ class FuelRouteOptimizationEngine:
             if lon is None:
                 lon = location_input.get('longitude')
             return Location(latitude=lat, longitude=lon)
-        return GeocodingService.geocode(location_input)
+        return GeocodingService.geocode(location_input, request_id=request_id)

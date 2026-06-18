@@ -54,7 +54,8 @@ class RoutingService:
         cls,
         start: Location,
         end: Location,
-        max_alternatives: int = 2
+        max_alternatives: int = 2,
+        request_id: str = ''
     ) -> List[RouteAlternative]:
         """Get route alternatives with multi-route database caching."""
         cache_key = EnhancedCacheKeyGenerator.route_key(
@@ -70,7 +71,7 @@ class RoutingService:
 
         # Step 2: Use request coalescing to prevent duplicate Google API calls
         def compute_routes():
-            logger.info(f"Calling Google Directions API: {start.as_tuple()} -> {end.as_tuple()}")
+            logger.info(f"[{request_id}] Calling Google Directions API: {start.as_tuple()} -> {end.as_tuple()}")
             try:
                 directions_url = "https://maps.googleapis.com/maps/api/directions/json"
 
@@ -106,7 +107,7 @@ class RoutingService:
 
                 routes_list = []
                 routes_data = data.get('routes', [])
-                logger.info(f"Got {len(routes_data)} routes from Google API")
+                logger.info(f"[{request_id}] Got {len(routes_data)} routes from Google API")
 
                 for i, route in enumerate(routes_data[:max_alternatives]):
                     try:
@@ -125,12 +126,12 @@ class RoutingService:
                         )
                         routes_list.append(route_alt)
                         logger.info(
-                            f"Route {route_alt.route_id}: {route_alt.distance_miles:.1f} mi, "
+                            f"[{request_id}] Route {route_alt.route_id}: {route_alt.distance_miles:.1f} mi, "
                             f"{route_alt.duration_seconds/3600:.1f} hrs"
                         )
 
                     except Exception as e:
-                        logger.warning(f"Failed to parse route {i}: {e}")
+                        logger.warning(f"[{request_id}] Failed to parse route {i}: {e}")
 
                 if not routes_list:
                     raise Exception("No valid routes returned from Google API")
@@ -138,11 +139,11 @@ class RoutingService:
                 # Cache ALL alternatives (each with unique key)
                 cls._cache_routes(base_key, routes_list)
 
-                logger.info(f"Successfully got {len(routes_list)} alternative routes")
+                logger.info(f"[{request_id}] Successfully got {len(routes_list)} alternative routes")
                 return routes_list
 
             except Exception as e:
-                logger.error(f"Google Directions API error: {e}", exc_info=True)
+                logger.error(f"[{request_id}] Google Directions API error: {e}", exc_info=True)
                 raise
 
         result = RequestLockManager.coalesce_request(
