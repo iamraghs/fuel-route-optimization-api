@@ -1,20 +1,369 @@
 # Fuel Route Optimization API
 
-An API that finds fuel-efficient routes between two US locations by optimizing where and how much to refuel along the way. It takes two locations, figures out the best route options, decides which fuel stations to stop at and how much fuel to buy at each one, all while trying to minimize the total fuel cost for the trip.
+An API that computes minimum-fuel-cost routes between US locations by determining optimal refueling decisions across route alternatives. It handles everything from short trips (no stops needed) to coast-to-coast routes with multiple strategic refueling stops.
 
-Built with Django, DRF, PostgreSQL with PostGIS for spatial queries, and Redis for caching. Uses Google Maps APIs for directions and geocoding.
+Built with Django, DRF, PostgreSQL with PostGIS for geospatial queries, Redis for caching, and Google Maps APIs for directions and geocoding.
 
 ---
 
-## What This Project Does
+## Table of Contents
 
-The problem is straightforward: a truck needs to go from one city to another. It starts with a full tank. Along the way there are fuel stations with different prices. The API figures out:
+- [Problem Statement](#problem-statement)
+- [Core Features](#core-features)
+- [Architecture Overview](#architecture-overview)
+- [Request Lifecycle](#request-lifecycle)
+- [Fuel Optimization Strategy](#fuel-optimization-strategy)
+- [Route Selection](#route-selection)
+- [Cache Architecture](#cache-architecture)
+- [PostGIS Strategy](#postgis-strategy)
+- [Edge Cases Handled](#edge-cases-handled)
+- [Failure Handling](#failure-handling)
+- [Performance Characteristics](#performance-characteristics)
+- [Scalability Considerations](#scalability-considerations)
+- [Tradeoffs and Assumptions](#tradeoffs-and-assumptions)
+- [API Reference](#api-reference)
+- [Setup](#setup)
+- [Testing](#testing)
+- [Configuration](#configuration)
+- [Project Structure](#project-structure)
 
-- Which fuel stations to stop at
-- How much fuel to buy at each stop
-- Which route alternative gives the lowest total fuel cost
+---
 
-It handles everything from a short 50-mile trip (where you don't need to stop at all) to a cross-country 3000-mile run with multiple stops.
+## Problem Statement
+
+A truck with a full tank (50 gallons, 10 MPG) must travel from city A to city B. Fuel stations along the route have different prices. The goal is to minimize total fuel cost for the trip.
+
+This is not a shortest-path problem. A slightly longer route with cheaper station prices can cost less overall. The optimal plan depends on:
+
+- **Station price distribution** — prices vary by $1+/gallon between stations
+- **Station density** — dense corridors (I-95, Texas) vs sparse regions (Montana, Dakotas)
+- **Detour cost** — leaving the highway adds miles that consume fuel
+- **Range constraints** — 500 miles max per tank; must plan stops before running out
+- **Strategic tradeoffs** — buying less at a slightly expensive station now to buy more at a cheap station later
+
+The system must evaluate multiple route alternatives, select station stops, determine purchase quantities, and account for all these constraints simultaneously.
+
+---
+
+## Core Features
+
+- **Route alternative comparison**: Google Directions returns up to 2 routes; each is independently optimized for fuel cost
+- **Strategic fueling**: three decision strategies evaluated at each candidate stop (fill, partial-to-cheaper, destination-only)
+- **Price-aware lookahead**: scans all stations ahead within range to find cheaper options before committing to a purchase
+- **Detour-cost modeling**: effective distance includes a 2x penalty on detour miles
+- **Four-layer cache architecture**: hot Redis caches, persistent PostgreSQL route cache, in-process geometry LRU, with versioned invalidation
+- **Unreachable detection**: never returns `status: "success"` with negative fuel remaining
+- **Input hardening**: coordinate type validation, address length limits, null rejection
+
+---
+
+## Architecture Overview
+
+### Layers
+
+```
+api.py (DRF endpoint)
+  └── engine.py (orchestrator)
+       ├── geocoding.py          — Google Geocoding API (parallel via ThreadPoolExecutor)
+       ├── routing.py            — Google Directions API (request coalesced)
+       └── _standard_optimization_path  (distance > 500 miles)
+            ├── PostGIS corridor query  →  stations.py
+            ├── FuelOptimizer           →  optimizer.py
+            ├── RouteGeometryValidator  →  route_geometry.py
+            └── RouteComparator         →  route_selector.py
+```
+
+### Data Separation
+
+| Data Type | Storage | Volatility |
+|-----------|---------|------------|
+| Station locations | PostgreSQL `FuelStation` | Static (preprocessing import) |
+| Fuel prices | PostgreSQL `FuelPrice` | Dynamic (versioned, append-only) |
+| Price versions | PostgreSQL `PriceVersion` | Dynamic (explicit publish) |
+| Route geometry | PostgreSQL `RouteCache` | Semi-static (24h TTL) |
+| Optimization results | Redis | Ephemeral (1h TTL) |
+| Geocode results | Redis | Ephemeral (7d TTL) |
+| Corridor station sets | Redis | Ephemeral (1h TTL) |
+| Decoded polylines | In-process `OrderedDict` (max 200) | Process lifetime (LRU) |
+
+### Vehicle Parameters
+
+| Parameter | Value | Constant |
+|-----------|-------|----------|
+| Tank capacity | 50 gallons | `VEHICLE_TANK` |
+| Fuel efficiency | 10 MPG | `VEHICLE_MPG` |
+| Max range (full tank) | 500 miles | `VEHICLE_MAX_RANGE` |
+| Reserve buffer | 50 miles (5 gallons) | `VEHICLE_RESERVE_MILES` |
+| Max detour per stop | 5 miles (round-trip) | `MAX_DETOUR_MILES` |
+| Corridor search radius | 50 miles | `CORRIDOR_BUFFER_MILES` |
+| Minimum purchase | 5 gallons | (hardcoded in optimizer) |
+
+---
+
+## Request Lifecycle
+
+### Cache Hit Path
+
+1. `engine.py` calls `get_cached_optimization()` with (normalized address, normalized address, price_version)
+2. Redis returns cached response
+3. `copy.deepcopy()` prevents in-place mutation of cached object (LocMemCache returns references)
+4. Per-request fields added (`request_id`, `optimization_time_ms`)
+5. Response returned. Zero Google API calls, zero DB queries.
+
+Typical latency: sub-50ms (Redis read + field injection).
+
+### Cache Miss Path
+
+1. **Parallel geocoding**: Start and end locations resolved via Google Geocoding API (2-worker `ThreadPoolExecutor`, 30s timeout). Results cached in Redis for 7 days.
+2. **Route fetch**: Google Directions API with `alternatives=true`, up to 2 routes. Request coalescing via Redis lock prevents duplicate API calls. Response cached in `RouteCache` table (24h TTL).
+3. **Fast-path check** (line 195): If primary route distance ≤ 500 miles, returns estimated fuel consumption with zero stops. No station queries, no optimization.
+4. **Standard path** (distance > 500 miles):
+   - Batch-fetch all fuel prices for active price version (1 DB query)
+   - Per-route PostGIS corridor query: `ST_DWithin` with GIST index
+   - Station-to-route snapping via perpendicular cross-track distance (corrects nearest-point approximation error)
+   - Fuel optimizer execution (Greedy + Lookahead)
+   - Geographic outlier stop filtering
+   - Route comparison via 3-key `min()` selection
+   - Response cached in Redis (1h TTL, keyed by normalized inputs + price version)
+
+### Repeat Request
+
+Cache hit path. Identical response (byte-compatible except `request_id` and timing fields).
+
+---
+
+## Fuel Optimization Strategy
+
+### Range-Aware Greedy with Lookahead
+
+The optimizer (`optimizer.py:calculate_fuel_stops`) processes stations in forward distance order from the current position. At each step:
+
+1. **Build candidate list**: Stations within reachable range of current position (current fuel minus 50-mile reserve). Stations >5 miles off-route excluded. Detour cost doubled in effective distance.
+
+2. **Evaluate each candidate in distance order** (first acceptable match wins):
+
+   - **to_destination**: Destination reachable after filling up. Buy only what is needed for the remaining distance plus reserve. Before committing, checks if a cheaper station is reachable directly from current position — if so, skips this station.
+   
+   - **partial**: Cheaper station exists ahead within full-tank range but is not directly reachable. Buy just enough fuel to reach that cheaper station (including reserve and a 20-mile safety margin).
+   
+   - **fill**: No cheaper station ahead. Fill tank for maximum flexibility.
+
+3. **Recompute**: After each stop, the optimizer re-evaluates from the new position with updated fuel level. Previously visited stations are tracked via `visited_stations = set()`.
+
+### Lookahead Implementation
+
+The `_station_index` dictionary (`optimizer.py:173-181`) contains ALL stations in the corridor (not just candidates). The lookahead at `optimizer.py:306-320` scans this index for stations that are:
+
+- Ahead of the current candidate's distance
+- Within full-tank range of the candidate
+- Cheaper than the candidate's price
+
+This is a forward scan across all stations, not just the current candidate list. Stations that become reachable only after filling up at the current candidate are included.
+
+### Safety Constraints
+
+- Minimum 5-gallon purchase prevents micro-stops
+- Stops <80 miles after previous fill with >60% fuel remaining are skipped
+- 50-mile reserve deducted from usable fuel at all decision points
+- If skipping a micro-refuel would leave the route stranded, override to fill
+- Station progression is verified monotonic; non-forward stops are removed
+
+---
+
+## Route Selection
+
+`RouteComparator.select_best_route` (`route_selector.py:31-58`) selects the minimum across all route optimizations using a 3-key tuple:
+
+```
+primary:   total fuel cost (ascending)       — minimize absolute trip cost
+secondary: stop count (ascending)            — fewer stops preferred
+tertiary:  route distance (ascending)        — shorter route as tiebreak
+```
+
+The `min()` function with a deterministic key ensures stable selection. When both routes have the same cost (extremely unlikely — float costs for different corridors differ measurably), the lower stop count breaks the tie, followed by shorter distance.
+
+All route alternatives are processed independently through the full optimization pipeline before comparison. No route is silently dropped — if Google returns 2 routes, both appear in `route_comparison`.
+
+---
+
+## Cache Architecture
+
+### Layer Details
+
+| Cache Layer | Storage | Key Format | TTL | Invalidated By |
+|-------------|---------|------------|-----|----------------|
+| Optimization | Redis | `fuel_routing:optimization:v1:{input_hash}:pv{version}` | 1 hour | Price version change (key mismatch) |
+| Route geometry | PostgreSQL `RouteCache` | `fuel_routing:route:v1:{coord_hash}` | 24 hours | TTL expiry |
+| Geocode | Redis | `fuel_routing:geocode:v1:{address_hash}` | 7 days | TTL expiry |
+| Corridor stations | Redis | `fuel_routing:corridor:v1:{id}:{polyline_hash}:buf{mi}` | 1 hour | TTL expiry |
+| Polyline geometry | In-process `OrderedDict` (max 200) | Polyline MD5 | Process lifetime | LRU eviction + Redis version check |
+| Price version | In-process (30s) + Redis (60s) | `price_version:active` | 30s / 60s | Explicit publish |
+
+### Cache Independence
+
+Price updates change `price_version`. The optimization cache key includes `price_version`, so old cached entries automatically produce a different key → cache miss → recomputation with new prices is triggered naturally.
+
+The following caches do NOT include price version and are unaffected by price changes:
+
+- Route geometry (keyed by coordinates only)
+- Geocode results (keyed by normalized address)
+- Corridor station sets (keyed by route polyline)
+- Polyline geometry (keyed by polyline content)
+
+This separation is intentional: station locations do not change when fuel prices do.
+
+### Request Coalescing
+
+`AtomicCacheOps.get_or_compute` (`cache_utils.py:356-419`) prevents duplicate expensive operations:
+
+1. Check cache → hit? return
+2. Acquire Redis lock (`cache.add`, 30s TTL)
+3. Double-check cache (another worker may have completed while acquiring lock)
+4. Compute and cache result
+5. If lock not acquired: poll `wait_for_result` every 100ms for up to 5s → timeout fallback: compute anyway
+
+Applied to: geocoding, route fetching, optimization computation.
+
+---
+
+## PostGIS Strategy
+
+### Corridor Query
+
+```python
+qs = FuelStation.objects.filter(
+    is_active=True,
+    opis_id__in=opis_ids_with_prices,       # pre-filter to ~5000 priced stations
+    location_point__dwithin=(route_line, D(mi=CORRIDOR_BUFFER_MILES)),
+)
+```
+
+- `ST_DWithin` on `PointField` with `geography=True` (geodetic distance calculation in meters)
+- GIST index on `location_point` (conditional on `IS NOT NULL`) provides logarithmic spatial selectivity
+- `opis_id__in` pre-filter bounds the candidate set to only stations with current prices (the bottleneck is priced stations, not total station count)
+
+### Fallback Path
+
+If PostGIS is unavailable (test environments, migration states), the system falls back to a two-stage filter:
+
+1. Decimal-degree bounding box pre-filter on `latitude`/`longitude` columns
+2. Python haversine calculation against sampled polyline waypoints
+
+Results from both paths are cached identically in `CorridorStationCache` (Redis, 1 hour).
+
+### Station Snapping
+
+Stations are snapped to the nearest point on the route polyline using perpendicular cross-track distance (`optimizer.py:snap_station_to_route`). This computes the true distance to each line segment, not the nearest coordinate point.
+
+This matters because Google's `overview_polyline` contains approximately 200 coordinate pairs regardless of route length. The average gap between adjacent coordinates is 13–16 miles, with maximum gaps exceeding 70 miles on straight highway segments. Nearest-point snapping misclassifies stations at the midpoint of a 14-mile gap as ~7 miles from the route, falsely exceeding the 5-mile detour limit. Cross-track distance eliminates this false rejection.
+
+---
+
+## Edge Cases Handled
+
+| Case | Behavior | Location |
+|------|----------|----------|
+| Source == destination | Returns 0 miles, 0 stops, `status: "success"` | engine.py:195-204 (fast path) |
+| Distance ≤ 500 miles | Fast path: estimated consumption, 0 stops, no DB queries | engine.py:195-204 |
+| Distance = 500.1 miles | Standard optimization activates, minimal stops added | engine.py:206-212 |
+| Station coverage ends before destination | `status: "unreachable"`, `missing_fuel_gallons` reported | engine.py:671+ |
+| No stations in corridor at all | `status: "unreachable"`, warning explains gap | engine.py:697-700 |
+| Route optimization failure (one alternative) | Per-route exception isolation; remaining route used | engine.py:533-539 |
+| Google returns only 1 route | `route_comparison` shows 1 entry; no fabricated route | routing.py:107-126 |
+| Price version changes mid-request | Cache key uses DB-fresh version ID, not request-start parameter | engine.py:731, 838-839 |
+| Concurrent identical requests | Redis lock + polling ensures single computation | cache_utils.py:356-419 |
+| LocMemCache in-place mutation | `copy.deepcopy()` before per-request field writes | engine.py:145 |
+| Perpendicular station distance | Cross-track formula recovers stations between sparse polyline points | optimizer.py:110-200 |
+| `{"lat": "abc", "lng": "def"}` coordinate abuse | Type-checked at serializer level; returns 400 | serializers.py:190-195 |
+| 50000-character address string | max_length=1024 check; returns 400 | serializers.py:185-189 |
+| Latitude = 0, longitude = 0 (equator) | Explicitly handled via `is None` check (not `or` falsy) | serializers.py:190-195, engine.py:890-895 |
+
+### Unreachable Route Response
+
+When `available_fuel_gallons < required_fuel_gallons` (with -0.1 gallon floating-point tolerance), the response format changes:
+
+```json
+{
+  "status": "unreachable",
+  "route_feasible": false,
+  "selected_route": {
+    "route_id": "route_a",
+    "distance_miles": 2479.8,
+    "is_optimal": false,
+    "reason": "Unable to complete route",
+    "warning": "Insufficient station coverage for complete optimization. Route cannot be completed."
+  },
+  "warning": "Route cannot be completed",
+  "fuel_stops": [],
+  "trip_summary": {
+    "total_distance_miles": 2479.8,
+    "required_fuel_gallons": 248.0,
+    "available_fuel_gallons": 162.1,
+    "missing_fuel_gallons": 85.9
+  }
+}
+```
+
+This replaces the previous behavior of returning `status: "success"` with negative `fuel_remaining_at_destination`. The serializer is bypassed for unreachable responses (trip_summary structure differs from success case).
+
+---
+
+## Failure Handling
+
+| Failure | Mechanism | HTTP Status |
+|---------|-----------|-------------|
+| Google Geocoding timeout | `timeout=(5, 10)` -> `GeocodeFailure` record -> `ValueError` | 400 |
+| Google Directions timeout | `timeout=(5, 10)` -> propagates through coalesce lock | 500 |
+| No active price version | `PriceVersion.objects.filter(is_active=True).first()` -> `ValueError` | 400 |
+| PostGIS exception | `try/except` -> fallback to bbox + Python haversine filter | 200 (degraded) |
+| Both corridor query paths fail | Per-route exception isolation -> empty station list | 200 (infeasible) |
+| ThreadPoolExecutor geocode timeout | `result(timeout=30)` -> `TimeoutError` -> per-request exception | 500 |
+| Rate limit exceeded | DRF `AnonRateThrottle` (1000/hour) | 429 |
+| No routes returned by Google | `if not routes_list: raise Exception` | 500 |
+| Duplicate route optimization failure | Route A succeeds, Route B fails -> B logged, A used | 200 |
+| All routes fail optimization | `select_best_route` receives empty list -> `ValueError` | 500 |
+
+---
+
+## Performance Characteristics
+
+Based on 180 test route observations:
+
+| Metric | Typical Value | Notes |
+|--------|---------------|-------|
+| Cache hit latency | <50ms | Redis get + per-request field injection |
+| Cold short route (<500mi) | ~800-1500ms | Geocoding + Directions API + estimate |
+| Cold long route (~1000mi) | ~1000-2500ms | Geocoding + Directions + PostGIS + optimizer |
+| Cold coast-to-coast (~3300mi) | ~1500-5000ms | Full pipeline, 10-16 stops |
+| Google API calls per request | 3 (cache miss) / 0 (cache hit) | 2 geocoding + 1 directions |
+| DB queries per cold request | 3-5 | PriceVersion, RouteCache, FuelPrice avg, station query |
+
+Measured from 180 test runs on the development environment (single-threaded, LocMemCache, Redis disabled). Production deployment behind Gunicorn with Redis will show different characteristics.
+
+---
+
+## Scalability Considerations
+
+- **Geocoding ThreadPoolExecutor**: Module-level `max_workers=2`. In production behind Gunicorn (4-8 workers), each worker has its own executor with independent queue. At 1 request per worker, queue depth ≤ 2, no timeout risk.
+- **Route optimization executor**: Per-request `ThreadPoolExecutor` with `max_workers=len(routes)` (max 2), created inside `with` block — automatically closed.
+- **ST_DWithin with GIST index**: O(log n) for spatial component. The `opis_id__in` pre-filter is constant (number of priced stations). Mixed-type `static/approx` index.
+- **Redis**: All cache keys have explicit TTLs (1h for optimization, 1h for corridor, 7d for geocode). No unbounded growth.
+- **RouteCache table**: Entries have `expires_at` field but no automated cleanup. At 10,000 unique routes/day (20,000 rows), annual storage is ~70GB for polyline data — manageable with PostgreSQL but warrants a monthly cleanup job at scale.
+- **GeocodeFailure table**: Grows with each failed geocoding attempt. `retry_count ≤ 10` cap limits per-entry retries, but entries are never archived. At high failure rates, monitoring is needed.
+
+---
+
+## Tradeoffs and Assumptions
+
+1. **Greedy over dynamic programming**: Range constraint (500mi) limits the lookahead horizon. True optimality across all station combinations would require DP with O(n²) complexity for negligible real-world savings given typical price variation of <$1/gal between nearby stations.
+
+2. **2 route alternatives**: Google Directions with `alternatives=true` typically returns 1-2 distinct routes. A third alternative was rarely meaningfully different and added ~50% more computation (corridor query + full optimization).
+
+3. **Fixed 50-mile corridor**: Station density along US interstates is such that 50 miles captures all usable stations (max detour is 5 miles). At 5-mile radius, every tested route has sufficient stations for its required stops. The corridor could be tightened to 10-25 miles based on route distance, reducing loaded stations by ~75% and Redis cache footprint proportionally.
+
+4. **Perpendicular over nearest-point distance**: Google's overview polyline has ~200 points regardless of route length. Average coordinate gap is 13-16 miles. Nearest-point snapping reports a station on the route at the midpoint of a 14-mile gap as 7 miles away, exceeding the 5-mile detour limit. Cross-track distance to line segments eliminates this false rejection.
+
+5. **200-waypoint sampling**: Used only for cumulative distance computation in the optimizer. The PostGIS corridor query uses the full LineString geometry — no sampling artifact at the query level.
 
 ---
 
@@ -22,22 +371,17 @@ It handles everything from a short 50-mile trip (where you don't need to stop at
 
 ### POST /route/fuel-optimization/
 
-Takes a start and finish location. Both can be either an address string or a lat/lng coordinate pair.
-
-**Request with addresses:**
+**Request:**
 
 ```json
 {"start": "Los Angeles, CA", "finish": "New York, NY"}
 ```
 
-**Request with coordinates:**
-
 ```json
 {"start": {"lat": 34.0522, "lng": -118.2437}, "finish": {"lat": 40.7128, "lng": -74.0060}}
 ```
 
-**Response:**
-
+**Successful response:**
 ```json
 {
   "status": "success",
@@ -90,96 +434,39 @@ Takes a start and finish location. Both can be either an address string or a lat
     "starting_fuel_gallons": 50,
     "fuel_purchased_at_stops": 98.0,
     "total_fuel_available": 148.0,
-    "fuel_remaining_at_destination": 0.0
+    "fuel_remaining_at_destination": 5.0
   }
 }
 ```
 
-The response includes the selected route with its fuel stops, comparison data for all route alternatives, and a trip summary with full fuel accounting.
-
 ---
 
-## How It Works
+## Testing
 
-### Request Flow
+180 integration tests covering 4 distance categories:
 
-When a request comes in, the first thing that happens is a cache check. If someone has already asked for the same route with the same fuel prices, the cached response comes back immediately without any API calls or computation.
+| Category | Count | Distance Range | Description |
+|----------|-------|----------------|-------------|
+| SHORT | 50 | < 500 miles | Fast path, 0 stops expected |
+| MED | 50 | 500-1500 miles | 2-4 stops, standard optimization |
+| LONG | 50 | 1500-3000 miles | 6-10 stops, multi-state travel |
+| COAST | 30 | > 3000 miles | Coast-to-coast, 10-16 stops |
 
-If its a cache miss, the system geocodes the start and end locations in parallel (two threads). Once it has coordinates, it calls the Google Directions API to get up to two route alternatives.
+Each test validates:
+- **Consumption**: selected route consumption matches trip summary
+- **Cost**: selected route cost matches trip summary
+- **Accounting**: available = consumed + remaining (within 0.1 gal tolerance)
+- **Math**: price × gallons = cost at each stop (within $0.015)
+- **Comparison**: selected route cost matches comparison entry
 
-For routes under 500 miles, the API takes a fast path. A full tank covers that distance, so theres no need to search for fuel stations at all. The response comes back with zero fuel stops and an estimated cost based on average fuel price.
+Tests run against a live server via HTTP requests (curl).
 
-For longer routes, the system queries the fuel station database to find stations near each route. It uses PostGIS spatial queries to find stations within a corridor along the route. This is much faster than loading all stations and filtering in Python.
+```bash
+# Start server, then run tests
+python test_all.py
 
-Each route alternative goes through the optimization engine independently. The optimizer figures out the best fuel stops, then the route comparator picks the one with the lowest total fuel cost.
-
-The result gets cached in Redis so the next request for the same route returns instantly.
-
-### Fuel Optimization Strategy
-
-The optimizer uses what I call a range-aware greedy approach. It starts at position zero with a full tank and works its way toward the destination.
-
-At each decision point (which is every time it considers a stop), it figures out how far it can actually go based on current fuel level and the reserve requirement. Only stations within that reachable range are considered as candidates.
-
-The decision logic works like this:
-
-If the destination is reachable from a candidate station after filling up, and theres no cheaper station ahead that we can reach directly, then this is the last stop. Buy only what you need to get to the destination, nothing extra.
-
-If theres a cheaper station within range from the candidate station, but we cant reach it directly from where we are now, buy just enough fuel at this station to make it to that cheaper station.
-
-If theres no cheaper station ahead within the range we would have after filling up, fill the tank. This maximizes flexibility for whatever comes next.
-
-The algorithm recomputes everything at every stop. It doesnt commit to a multi-stop plan and then follow it blindly. After each stop, it re-evaluates using the current fuel level and position. This is important because new stations become reachable as you move forward.
-
-### Safety Guards
-
-A few things keep the optimization practical:
-
-- Minimum 5-gallon purchase prevents micro-stops that waste time
-- Stops too close together (under 80 miles with plenty of fuel) get skipped
-- A 50-mile reserve ensures you never run dry
-- Stations more than 5 miles off the route are excluded
-- If skipping a station would leave no other options, the algorithm fills up anyway to keep moving
-
-### Caching
-
-There are several layers of caching because the costliest part of this system is the Google API calls.
-
-The optimization cache stores the full API response in Redis for an hour. The cache key includes the price version ID, so when fuel prices update, old cached responses naturally become different keys and stop being served.
-
-Route geometry from Google Directions gets cached in PostgreSQL for 24 hours. Geocoding results go to Redis for 7 days. Station corridor filters (which stations are near which route) get cached in Redis for an hour.
-
-There is also an in-process cache for decoded polyline geometry that avoids repeated decoding of the same route data during a single request.
-
-Request coalescing prevents duplicate Google API calls. If two people ask for the same route at the same time, only one request goes to Google. The other waits for the result.
-
-### Station Query
-
-For each route, the system needs to find fuel stations along the corridor. It starts with all stations that have active prices, then filters them using PostGIS spatial queries. The stations table has a GIST index on the location point, so this is a fast spatial lookup rather than a full table scan.
-
-If PostGIS isnt available (like in test environments with SQLite), it falls back to a bounding box pre-filter followed by a haversine distance check against the route polyline.
-
----
-
-## Project Structure
-
-```
-fuel_routing/
-  api.py              - REST API endpoint
-  views.py            - Health check endpoint
-  engine.py           - Main orchestrator that ties everything together
-  optimizer.py        - Fuel stop optimization algorithm
-  cache_service.py    - Optimization result cache layer
-  cache_utils.py      - Geometry cache, corridor cache, request locking
-  routing.py          - Google Directions API integration
-  geocoding.py        - Google Geocoding API integration
-  stations.py         - Fuel station query and filtering
-  route_selector.py   - Route comparison and selection
-  route_geometry.py   - Route validation and stop sequencing
-  constants.py        - Vehicle parameters and configuration
-  models.py           - Database models
-  serializers.py      - Request/response serializers
-  preprocessing.py    - CSV data preprocessing pipeline
+# Expected output:
+# RESULTS: 180/180 passed | 0/180 failed
 ```
 
 ---
@@ -187,66 +474,67 @@ fuel_routing/
 ## Setup
 
 ```bash
-# Create virtual environment and install dependencies
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# Database setup (PostgreSQL with PostGIS required)
-export DATABASE_URL=postgis://user:password@localhost:5432/fuel_routing
+# Database (PostgreSQL 14+ with PostGIS 3.2+)
+createdb fuel_routing_dev
+psql fuel_routing_dev -c "CREATE EXTENSION postgis;"
 python manage.py migrate
-
-# Load fuel station data
 python manage.py preprocess_fuel_data
 python manage.py load_fuel_data fuel_prices_cleaned.csv
 
-# Configure Google Maps API
+# Environment
 export GOOGLE_MAPS_API_KEY=your_key_here
+export REDIS_ENABLED=False
+export DATABASE_URL=postgis://user:pass@localhost:5432/fuel_routing_dev
 
-# Start server
+# Development
+python manage.py runserver
+
+# Production
 gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4
+export REDIS_ENABLED=True
 ```
-
----
-
-## Testing
-
-The test suite sends requests to a running server and validates every field in the response. It covers 180 routes across short trips (under 500 miles), medium trips, long trips, and coast-to-coast routes.
-
-```bash
-# Start the server first, then run tests
-python test_all.py
-```
-
-Each test checks that the response includes all required fields, that the fuel accounting adds up (starting fuel plus purchased fuel minus consumed fuel equals remaining fuel), that stop costs are calculated correctly (price times gallons equals cost), and that distances are consistent.
 
 ---
 
 ## Configuration
 
-Key parameters that control the vehicle model and optimization behavior are in `constants.py`:
+Vehicle and optimization parameters in `constants.py` (all configurable via Django settings):
 
-- Vehicle fuel efficiency (miles per gallon)
-- Fuel tank capacity in gallons
-- Reserve fuel buffer in miles
-- Maximum detour distance in miles
-- Minimum fuel purchase amount in gallons
-- Corridor buffer width for station queries
-
-These are set through Django settings and can be adjusted per deployment.
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `VEHICLE_FUEL_EFFICIENCY` | 10 | Miles per gallon |
+| `VEHICLE_FUEL_TANK_CAPACITY` | 50 | Gallons |
+| `VEHICLE_MAX_RANGE` | 500 | Miles (tank × MPG) |
+| `VEHICLE_RESERVE_RANGE_MILES` | 50 | Reserve buffer |
+| `FUEL_STOP_CORRIDOR_BUFFER_MILES` | 50 | PostGIS corridor width |
+| `FUEL_STOP_MAX_DETOUR_MILES` | 5 | Maximum station detour |
 
 ---
 
-## Design Notes
+## Project Structure
 
-A few decisions that came up during development:
-
-The optimization algorithm uses a greedy approach rather than dynamic programming. The tank range naturally limits how far ahead you need to look, and recomputing at every stop catches cases where the greedy choice wasnt ideal. This keeps the computation fast while still producing good results.
-
-The API always evaluates two route alternatives from Google Directions and picks the cheaper one. Three routes were considered but the third was usually a minor variation of the first two and added compute time without meaningful benefit.
-
-Redis is used for most caching because sub-millisecond reads matter when the system is handling many requests. PostgreSQL RouteCache exists only for route geometry that benefits from PostGIS spatial types.
-
-The station corridor filter uses PostGIS spatial queries with a GIST index. An earlier version did all filtering in Python with haversine calculations, but the spatial SQL approach is significantly faster with thousands of stations to evaluate.
-
-Route and geocode inputs are normalized before computing cache keys. This means Los Angeles, CA and los angeles, ca produce the same key and share a cached result.
+```
+fuel_routing/
+  api.py              — REST API endpoint (POST /route/fuel-optimization/)
+  views.py            — Health check endpoint (GET /route/health/)
+  engine.py           — Request orchestrator, response building, unreachable detection
+  optimizer.py        — Greedy + Lookahead fuel optimizer, cross-track snapping
+  cache_service.py    — Optimization result cache (Redis, price-version keyed)
+  cache_utils.py      — Geometry LRU, CorridorStationCache, request coalescing, atomic cache ops
+  routing.py          — Google Directions API, RouteCache persistence
+  geocoding.py        — Google Geocoding API, failure tracking
+  stations.py         — FuelStationQueryService, polyline corridor filtering
+  route_selector.py   — RouteComparator, cost-based selection
+  route_geometry.py   — RouteGeometryValidator, stop sequence validation
+  constants.py        — Vehicle parameters and cache TTLs
+  models.py           — FuelStation, FuelPrice, PriceVersion, RouteCache, RouteRequest, GeocodeFailure
+  serializers.py      — Request validation (input hardening), response serialization
+  preprocessing.py    — CSV preprocessing pipeline (10 stages, 5141 stations)
+config/
+  settings.py         — Django settings, cache configuration, throttle rates
+test_all.py           — 180-route integration test suite
+```
