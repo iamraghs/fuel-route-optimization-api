@@ -531,12 +531,15 @@ class FuelRouteOptimizationEngine:
         with ThreadPoolExecutor(max_workers=len(routes_list)) as executor:
             futures = {executor.submit(_optimize_single_route, r): r for r in routes_list}
             for future in as_completed(futures):
-                opt_route, opt_stops, opt_cost = future.result()
-                route_optimizations.append((opt_route, opt_stops, opt_cost))
-                logger.info(
-                    f"[{request_id}] {opt_route.route_id} complete: "
-                    f"{len(opt_stops)} stops, ${opt_cost:.2f}"
-                )
+                try:
+                    opt_route, opt_stops, opt_cost = future.result()
+                    route_optimizations.append((opt_route, opt_stops, opt_cost))
+                    logger.info(
+                        f"[{request_id}] {opt_route.route_id} complete: "
+                        f"{len(opt_stops)} stops, ${opt_cost:.2f}"
+                    )
+                except Exception as e:
+                    logger.error(f"[{request_id}] Route optimization failed: {e}")
 
         # Select best route
         selected_route, selected_stops, selected_cost = \
@@ -657,6 +660,85 @@ class FuelRouteOptimizationEngine:
             actual_fuel_consumed = selected_route.distance_miles / VEHICLE_MPG
             fuel_remaining_val = VEHICLE_TANK + fuel_purchased_total - actual_fuel_consumed
 
+        # Determine if route is physically impossible (fuel deficit even with all stops)
+        required_fuel_gallons = selected_route.distance_miles / VEHICLE_MPG
+        available_fuel_gallons = VEHICLE_TANK + fuel_purchased_total
+        remaining_fuel = available_fuel_gallons - required_fuel_gallons
+        route_impossible = remaining_fuel < -0.1  # tolerance for floating-point edge cases
+
+        if route_impossible:
+            unreachable_cost = round(avg_price * available_fuel_gallons, 2)
+            warning_msg = (
+                'No fuel stations found in database for this route corridor. '
+                'Route cannot be completed.'
+            ) if no_stations_available else (
+                'Insufficient station coverage for complete optimization. '
+                'Route cannot be completed.'
+            )
+            response = {
+                '_cache_hit': False,
+                'route_feasible': False,
+                'optimization_confidence': 'insufficient_data',
+                'status': 'unreachable',
+                'request_id': request_id,
+                'optimization_time_ms': elapsed_ms,
+                'request': {
+                    'start': {
+                        'city': start_city,
+                        'state': start_state,
+                        'formatted_address': start_formatted
+                    },
+                    'finish': {
+                        'city': end_city,
+                        'state': end_state,
+                        'formatted_address': end_formatted
+                    }
+                },
+                'selected_route': {
+                    'route_id': selected_route.route_id,
+                    'distance_miles': round(selected_route.distance_miles, 1),
+                    'is_optimal': False,
+                    'reason': 'Unable to complete route',
+                    'estimated_total_fuel_consumption_gallons': round(available_fuel_gallons, 1),
+                    'estimated_total_fuel_cost': unreachable_cost,
+                    'fuel_stops_required': 0,
+                    'warning': warning_msg,
+                },
+                'route_comparison': [
+                    {
+                        'route_id': r.route_id,
+                        'distance_miles': round(r.distance_miles, 1),
+                        'estimated_total_fuel_cost': unreachable_cost,
+                        'fuel_stops_required': len(s),
+                        'selected': r.route_id == selected_route.route_id
+                    }
+                    for r, s, c in route_optimizations
+                ],
+                'warning': warning_msg,
+                'fuel_stops': [],
+                'trip_summary': {
+                    'total_distance_miles': round(selected_route.distance_miles, 1),
+                    'required_fuel_gallons': round(required_fuel_gallons, 1),
+                    'available_fuel_gallons': round(available_fuel_gallons, 1),
+                    'missing_fuel_gallons': round(abs(remaining_fuel), 1),
+                    'starting_fuel_gallons': VEHICLE_TANK,
+                    'fuel_purchased_at_stops': round(fuel_purchased_total, 1),
+                    'total_fuel_available': round(available_fuel_gallons, 1),
+                    'total_fuel_consumed_gallons': round(available_fuel_gallons, 1),
+                    'fuel_remaining_at_destination': 0.0,
+                    'total_fuel_cost': unreachable_cost,
+                    'average_price_per_gallon': round(avg_price, 2),
+                    'total_fuel_stops': 0,
+                }
+            }
+            set_cached_optimization(start_input, end_input, response, price_version=price_version_obj.id)
+            logger.warning(
+                f"[{request_id}] Route impossible: need {required_fuel_gallons:.1f}gal, "
+                f"have {available_fuel_gallons:.1f}gal, "
+                f"shortfall {abs(remaining_fuel):.1f}gal"
+            )
+            return response
+
         # Compute cost estimate — use distance-based for infeasible routes
         if infeasible:
             estimated_fuel_cost = round(
@@ -755,8 +837,9 @@ class FuelRouteOptimizationEngine:
             }
         }
 
-        # Cache result using unified cache service
-        set_cached_optimization(start_input, end_input, response, price_version=pv)
+        # Cache result using unified cache service (use DB-fresh version, not potentially stale pv)
+        cache_pv = price_version_obj.id if price_version_obj else pv
+        set_cached_optimization(start_input, end_input, response, price_version=cache_pv)
         logger.info(f"[{request_id}] Optimization complete in {elapsed_ms}ms")
 
         return response

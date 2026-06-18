@@ -181,19 +181,39 @@ class FuelOptimizationRequestSerializer(serializers.Serializer):
     
     def validate_start(self, value):
         """Validate start location format."""
-        if isinstance(value, str) and len(value) > 0:
-            return value
+        if isinstance(value, str):
+            if 1 <= len(value) <= 1024:
+                return value
+            raise serializers.ValidationError(
+                "Address must be between 1 and 1024 characters"
+            )
         if isinstance(value, dict):
-            if 'lat' in value and 'lng' in value:
+            lat = value.get('lat')
+            if lat is None:
+                lat = value.get('latitude')
+            lng = value.get('lng')
+            if lng is None:
+                lng = value.get('longitude')
+            if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
                 return value
         raise serializers.ValidationError("Must be address string or {'lat': x, 'lng': y}")
-    
+
     def validate_finish(self, value):
         """Validate finish location format."""
-        if isinstance(value, str) and len(value) > 0:
-            return value
+        if isinstance(value, str):
+            if 1 <= len(value) <= 1024:
+                return value
+            raise serializers.ValidationError(
+                "Address must be between 1 and 1024 characters"
+            )
         if isinstance(value, dict):
-            if 'lat' in value and 'lng' in value:
+            lat = value.get('lat')
+            if lat is None:
+                lat = value.get('latitude')
+            lng = value.get('lng')
+            if lng is None:
+                lng = value.get('longitude')
+            if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
                 return value
         raise serializers.ValidationError("Must be address string or {'lat': x, 'lng': y}")
 

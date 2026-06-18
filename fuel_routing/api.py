@@ -56,8 +56,14 @@ def optimize_fuel_route(request):
         except Exception as e:
             logger.warning(f"Failed to log route request: {e}")
         
-        response_serializer = FuelOptimizationResponseSerializer(result)
-        http_response = Response(response_serializer.data, status=status.HTTP_200_OK)
+        if result.get('status') == 'unreachable':
+            http_response = Response(
+                {k: v for k, v in result.items() if not k.startswith('_')},
+                status=status.HTTP_200_OK
+            )
+        else:
+            response_serializer = FuelOptimizationResponseSerializer(result)
+            http_response = Response(response_serializer.data, status=status.HTTP_200_OK)
 
         http_response['Cache-Control'] = 'max-age=43200, public'
         http_response['ETag'] = hashlib.md5(str(result).encode()).hexdigest()[:16]
