@@ -664,3 +664,4 @@ config/
   settings.py         — Django settings, cache configuration, throttle rates
 test_all.py           — 180-route integration test suite
 ```
+
