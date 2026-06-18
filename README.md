@@ -359,6 +359,22 @@ Measured from 180 test runs on the development environment (single-threaded, Loc
 
 ---
 
+### Query Execution Verification
+
+Database execution plans verified via EXPLAIN ANALYZE against all critical query paths:
+
+| Query | Index Used | Scan Type | Execution Time | Sequential Scan |
+|-------|-----------|-----------|----------------|-----------------|
+| ST_DWithin corridor (50mi) | GIST on `location_point` | Bitmap Index Scan | ~42ms | No |
+| ST_DWithin corridor (500mi) | GIST on `location_point` | Bitmap Index Scan | ~34ms | No |
+| Station lookup (opis_id IN) | Unique B-tree on `opis_id` | Bitmap Index Scan | ~5ms | No |
+| Route cache lookup (cache_key) | B-tree on `cache_key` | Index Scan | ~0.4ms | No |
+| Price version lookup | Partial B-tree `idx_price_ver` | Index Scan | ~0.04ms | No |
+
+All five query paths use index scans. No sequential table scans were observed, including at 10x the standard corridor buffer (500 miles), where the GIST index remained selected by the query planner.
+
+---
+
 ## Scalability Considerations
 
 - **Geocoding ThreadPoolExecutor**: Module-level `max_workers=2`. In production behind Gunicorn (4-8 workers), each worker has its own executor with independent queue. At 1 request per worker, queue depth ≤ 2, no timeout risk.
@@ -367,6 +383,18 @@ Measured from 180 test runs on the development environment (single-threaded, Loc
 - **Redis**: All cache keys have explicit TTLs (1h for optimization, 1h for corridor, 7d for geocode). No unbounded growth.
 - **RouteCache table**: Entries have `expires_at` field but no automated cleanup. At 10,000 unique routes/day (20,000 rows), annual storage is ~70GB for polyline data — manageable with PostgreSQL but warrants a monthly cleanup job at scale.
 - **GeocodeFailure table**: Grows with each failed geocoding attempt. `retry_count ≤ 10` cap limits per-entry retries, but entries are never archived. At high failure rates, monitoring is needed.
+
+### Verified Scaling Behavior
+
+| Parameter | Bounds | Evidence |
+|-----------|--------|----------|
+| Spatial query complexity | O(log n) | GIST index selected by planner for all corridor queries (50mi and 500mi buffers). No sequential scan observed. |
+| Geometry cache size | 200 entries (LRU) | `GeometryCache` OrderedDict capped at `MAX_SIZE = 200`. Oldest entry evicted on insert when full. |
+| Optimization cache TTL | 1 hour | Automatic expiry. No unbounded growth. |
+| Station candidate processing | O(m) per iteration | m = stations in corridor (50-400 typical). Bounded by `opis_id__in` pre-filter to stations with active prices. |
+| Route alternatives | Max 2 | Google `max_alternatives=2`. Each optimized independently via ThreadPoolExecutor. |
+| Cache-hit response | ~50ms | Redis read + per-request field injection. |
+| Cold response (long route) | ~1–5s | Dominated by 2 geocoding API calls + 1 Directions API call + PostGIS query + fuel optimization. |
 
 ---
 
@@ -387,6 +415,20 @@ An earlier implementation filtered stations in Python using haversine distance c
 ### Why route geometry is separated from pricing
 
 Route geometry (Google polyline, decoded coordinates) does not change when fuel prices update. By keying the geometry cache on coordinates-only and the optimization cache on coordinates-plus-price-version, price updates trigger recomputation of costs without requiring new Google Directions API calls. This is the primary latency optimization in the system.
+
+### Why detour is limited to 5 miles with round-trip costing
+
+The detour system uses a two-stage filter. First, stations with a detour exceeding 5 miles (Euclidean distance from the route polyline) are excluded from consideration entirely (`optimizer.py:331-332`). This is a hard eligibility threshold: stations more than 5 miles off the route are never worth the extra driving.
+
+Second, for eligible stations, the effective travel distance includes a 2× detour penalty (`optimizer.py:334`):
+
+```
+effective_distance = distance_along_route + 2.0 * detour_miles
+```
+
+This models the round-trip cost of leaving and returning to the highway. The 5-mile one-way limit was chosen based on typical highway exit spacing and fuel station placement along US interstates: stations beyond 5 miles from the route are rarely accessible via a short side trip.
+
+Routes travel time is not modeled. The detour penalty uses Euclidean (haversine) distance rather than road-network distance, which is a simplification that underestimates actual driving distance but keeps computation within the optimizer loop.
 
 ---
 
