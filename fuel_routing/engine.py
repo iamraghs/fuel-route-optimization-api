@@ -77,15 +77,22 @@ def _get_avg_price_for_version(price_version_id: int) -> float:
     return get_cached_avg_price(price_version_id)
 
 
-def _build_map_link(start_input, end_input, start_loc, end_loc) -> str:
+def _build_map_link(start_input, end_input, start_loc, end_loc, start_address='', end_address='') -> str:
     """Build Google Maps URL using formatted address when available, else coordinates."""
     def _encode(val):
         if isinstance(val, str):
             return urllib.parse.quote(val)
         return None
 
-    origin = _encode(start_input) if isinstance(start_input, str) else None
-    dest = _encode(end_input) if isinstance(end_input, str) else None
+    if start_address:
+        origin = _encode(start_address)
+    else:
+        origin = _encode(start_input) if isinstance(start_input, str) else None
+    if end_address:
+        dest = _encode(end_address)
+    else:
+        dest = _encode(end_input) if isinstance(end_input, str) else None
+
     if origin and dest:
         return f"https://www.google.com/maps/dir/{origin}/{dest}"
 
@@ -101,8 +108,7 @@ class FuelRouteOptimizationEngine:
     def _parse_location_for_display(location_input: str | Dict[str, float]) -> Tuple[str, str, str]:
         """Parse location input to extract city, state, and formatted address."""
         if isinstance(location_input, dict):
-            return ('Unknown', 'US',
-                    f"Coordinates ({location_input.get('lat', 0):.4f}, {location_input.get('lng', 0):.4f})")
+            return ('Unknown', 'Unknown', 'Location pending')
 
         address = str(location_input).strip()
         parts = [p.strip() for p in address.split(',')]
@@ -189,6 +195,16 @@ class FuelRouteOptimizationEngine:
             if not start_loc or not end_loc:
                 raise ValueError("Could not geocode start or end location")
 
+            # For coordinate inputs, reverse-geocode to get human-readable address
+            if isinstance(start_input, dict):
+                start_city, start_state, start_formatted = GeocodingService.reverse_geocode(
+                    start_loc.latitude, start_loc.longitude, request_id
+                )
+            if isinstance(end_input, dict):
+                end_city, end_state, end_formatted = GeocodingService.reverse_geocode(
+                    end_loc.latitude, end_loc.longitude, request_id
+                )
+
             # Get routes from Google API
             routes = RoutingService.get_routes(start_loc, end_loc, max_alternatives=2, request_id=request_id)
             if not routes:
@@ -236,7 +252,7 @@ class FuelRouteOptimizationEngine:
         best_route = min(routes, key=lambda r: r.distance_miles)
         elapsed_ms = int((time.time() - start_time) * 1000)
 
-        route_map_link = _build_map_link(start_input, end_input, start_loc, end_loc)
+        route_map_link = _build_map_link(start_input, end_input, start_loc, end_loc, start_formatted, end_formatted)
 
         estimated_fuel = best_route.distance_miles / VEHICLE_MPG
         estimated_cost = estimated_fuel * avg_price_per_gal
@@ -667,7 +683,6 @@ class FuelRouteOptimizationEngine:
         route_impossible = remaining_fuel <= -0.1  # tolerance for floating-point edge cases
 
         if route_impossible:
-            unreachable_cost = round(avg_price * available_fuel_gallons, 2)
             warning_msg = (
                 'No fuel stations found in database for this route corridor. '
                 'Route cannot be completed.'
@@ -697,19 +712,19 @@ class FuelRouteOptimizationEngine:
                 'selected_route': {
                     'route_id': selected_route.route_id,
                     'distance_miles': round(selected_route.distance_miles, 1),
-                    'is_optimal': False,
+                    'is_optimal': None,
                     'reason': 'Unable to complete route',
-                    'estimated_total_fuel_consumption_gallons': round(available_fuel_gallons, 1),
-                    'estimated_total_fuel_cost': unreachable_cost,
-                    'fuel_stops_required': 0,
-                    'warning': warning_msg,
+                    'estimated_total_fuel_consumption_gallons': None,
+                    'estimated_total_fuel_cost': None,
+                    'fuel_stops_required': None,
                 },
                 'route_comparison': [
                     {
                         'route_id': r.route_id,
                         'distance_miles': round(r.distance_miles, 1),
-                        'estimated_total_fuel_cost': unreachable_cost,
-                        'fuel_stops_required': len(s),
+                        'estimated_total_fuel_cost': None,
+                        'fuel_stops_required': None,
+                        'route_feasible': False,
                         'selected': r.route_id == selected_route.route_id
                     }
                     for r, s, c in route_optimizations
@@ -726,8 +741,8 @@ class FuelRouteOptimizationEngine:
                     'total_fuel_available': round(available_fuel_gallons, 1),
                     'total_fuel_consumed_gallons': round(available_fuel_gallons, 1),
                     'fuel_remaining_at_destination': 0.0,
-                    'total_fuel_cost': unreachable_cost,
-                    'average_price_per_gallon': round(avg_price, 2),
+                    'total_fuel_cost': None,
+                    'average_price_per_gallon': None,
                     'total_fuel_stops': 0,
                 }
             }
@@ -752,7 +767,7 @@ class FuelRouteOptimizationEngine:
             estimated_fuel_cost = response_total_cost
 
         # Generate Google Maps navigation link
-        route_map_link = _build_map_link(start_input, end_input, start_loc, end_loc)
+        route_map_link = _build_map_link(start_input, end_input, start_loc, end_loc, start_formatted, end_formatted)
 
         response = {
             '_cache_hit': False,

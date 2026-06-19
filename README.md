@@ -274,6 +274,49 @@ Stations are snapped to the nearest point on the route polyline using perpendicu
 
 This matters because Google's `overview_polyline` contains approximately 200 coordinate pairs regardless of route length. The average gap between adjacent coordinates is 13–16 miles, with maximum gaps exceeding 70 miles on straight highway segments. Nearest-point snapping misclassifies stations at the midpoint of a 14-mile gap as ~7 miles from the route, falsely exceeding the 5-mile detour limit. Cross-track distance eliminates this false rejection.
 
+### Coordinate Privacy
+
+Coordinate inputs (lat/lng pairs) are resolved to human-readable addresses before appearing in API responses. The system calls Google Geocoding API with `latlng` parameter for reverse geocoding, then caches the result in Redis (7-day TTL).
+
+Raw coordinates remain internal-only for:
+- PostGIS spatial queries (`ST_DWithin`)
+- Route geometry decoding and caching
+- Cache key generation
+- Fuel optimization internals
+
+API responses contain city, state, and formatted address only. Route map links use address strings rather than raw coordinate URLs. If reverse geocoding fails, the response returns `"Location unavailable"` without exposing coordinates.
+
+Before (coordinates exposed):
+```
+"formatted_address": "Coordinates (34.0522, -118.2437)"
+"route_map_link": "...maps/dir/34.0522,-118.2437/..."
+```
+
+After (human-readable):
+```
+"formatted_address": "Los Angeles, CA, USA"
+"city": "Los Angeles"
+"state": "CA"
+"route_map_link": "...maps/dir/Los+Angeles+CA/..."
+```
+
+### Reverse Geocoding Lifecycle
+
+```
+Coordinate input (lat, lon)
+  -> GeocodingService.reverse_geocode(lat, lon)
+    -> Check Redis cache (geocode key)
+      -> HIT: return cached (city, state, formatted_address)
+      -> MISS: call Google Geocoding API with latlng parameter
+        -> Parse address_components for locality + administrative_area
+        -> Cache result in Redis (7-day TTL)
+        -> Return (city, state, formatted_address)
+  -> Update request display objects
+  -> Build map link using formatted address
+```
+
+Reverse geocoding runs once per unique coordinate pair and reuses cached values across subsequent requests. The cache key is shared with forward geocoding, preventing duplicate API calls for the same location regardless of input format.
+
 ---
 
 ## Edge Cases Handled
@@ -513,6 +556,49 @@ Metrics aggregation (Prometheus), structured alerting, and automated deployment 
 
 ---
 
+## Observability
+
+Each request carries a unique `request_id` logged as `[{request_id}]` prefix across all subsystems:
+
+- **Engine**: request start, cache hit/miss, route processing, optimization completion, failure conditions
+- **Geocoding**: API call, cache hit/miss, reverse geocoding results, failure records
+- **Route generation**: Google API calls, number of alternatives returned, parse failures
+- **Optimizer**: candidate station counts, strategy selection, fuel progression, stop creation
+- **PostGIS**: corridor query results, fallback activation, cache hits for corridor station sets
+
+Log level distribution: INFO for normal operations, WARNING for fallback activation and degraded modes, ERROR for failures and impossible routes.
+
+Health check endpoint (`GET /route/health/`) reports:
+- Database connectivity and active price version
+- Cache connectivity
+- Total request counter
+- Optimization cache hit counter
+
+---
+
+## Admin Operations
+
+### Price Updates
+
+Fuel prices are versioned through `PriceVersion`. A new version is published atomically:
+1. Prices are imported with their version ID
+2. The `PriceVersion.publish()` method deactivates the old version and activates the new one in a single transaction
+3. Optimization cache entries keyed by the old version ID become inaccessible (key mismatch), forcing recomputation with new prices
+4. Route geometry cache and corridor station cache are unaffected (they store coordinates, not prices)
+
+### Station Data
+
+Station import runs through the preprocessing pipeline (`preprocessing.py`):
+- CSV loading with column validation
+- Address normalization and highway pattern expansion
+- USA-only filtering (50 states + DC)
+- Deduplication by OPIS ID (latest observation wins)
+- Geocoding preparation
+
+Only stations with valid coordinates and active prices participate in corridor queries.
+
+---
+
 ## API Reference
 
 ### POST /route/fuel-optimization/
@@ -587,11 +673,41 @@ Metrics aggregation (Prometheus), structured alerting, and automated deployment 
 
 ---
 
+## Response Contract Matrix
+
+Different API response types follow distinct contract rules:
+
+| Response Type | status | request_id | route_feasible | selected_route | fuel_stops |
+|--------------|--------|-----------|----------------|----------------|------------|
+| SUCCESS | `"success"` | required | `true` | Full route object with numeric costs | Populated with stop details |
+| UNREACHABLE | `"unreachable"` | required | `false` | Present with `is_optimal: null`, `fuel_stops_required: null`, `estimated_total_fuel_cost: null` | `[]` (empty) |
+| SERIALIZER ERROR | not present | not present | not present | not present | not present |
+| SERVER ERROR | not present | not present | not present | not present | not present |
+
+Unreachable responses replace completed-route metrics with availability information:
+```json
+"trip_summary": {
+    "required_fuel_gallons": 549.5,
+    "available_fuel_gallons": 287.8,
+    "missing_fuel_gallons": 261.7
+}
+```
+
+Serializer errors return HTTP 400 with field-specific validation messages:
+```json
+{"start": ["Must be address string or {'lat': x, 'lng': y}"]}
+```
+
+Server errors return HTTP 500 with an error description:
+```json
+{"error": "Optimization failed", "detail": "..."}
+```
+
 ## Testing
 
 ### Integration Tests
 
-180 integration tests covering 4 distance categories:
+186 integration tests covering 4 distance categories plus additional edge cases:
 
 | Category | Count | Distance Range | Description |
 |----------|-------|----------------|-------------|
@@ -599,19 +715,15 @@ Metrics aggregation (Prometheus), structured alerting, and automated deployment 
 | MED | 50 | 500-1500 miles | 2-4 stops, standard optimization |
 | LONG | 50 | 1500-3000 miles | 6-10 stops, multi-state travel |
 | COAST | 30 | > 3000 miles | Coast-to-coast, 10-16 stops |
+| EDGE/INVALID | 6 | — | Coordinate input, same start/dest, unreachable, malformed input |
 
-Each test validates:
-- **Consumption**: selected route consumption matches trip summary
-- **Cost**: selected route cost matches trip summary
-- **Accounting**: available = consumed + remaining (within 0.1 gal tolerance)
-- **Math**: price × gallons = cost at each stop (within $0.015)
-- **Comparison**: selected route cost matches comparison entry
+**Pass rate: 186/186 (all tests passing, 0 failures)**
 
 Tests run against a live server via HTTP requests (curl).
 
 ### Invariants Verified
 
-Each test validates the following invariants, checked against every response:
+Each test validates the following invariants against every response:
 
 - **Fuel conservation**: `starting_fuel + purchased_fuel = consumed_fuel + remaining_fuel` (within 0.1 gallon tolerance)
 - **Cost consistency**: `selected_route cost = trip_summary cost` (within $0.01 tolerance)
@@ -619,6 +731,9 @@ Each test validates the following invariants, checked against every response:
 - **Route comparison**: comparison entry for selected route matches `selected_route` cost
 - **Stop ordering**: fuel stop mile markers are strictly increasing
 - **No duplicate stations**: no repeated station names in fuel stop list
+- **Unreachable**: empty `fuel_stops`, nulled cost fields, `missing_fuel_gallons > 0`
+- **Serializer errors**: field-specific error keys present, no `status`/`request_id` required
+- **Coordinate privacy**: no raw coordinates in response body or map URLs
 
 ### Boundary Tests
 
@@ -628,13 +743,26 @@ Each test validates the following invariants, checked against every response:
 - Malformed coordinate inputs (type rejection)
 - Null input values (serializer rejection)
 - Extremely long address strings (max_length enforcement)
+- Large coordinate gaps on long routes (cross-track distance verification)
+
+### Validation Artifacts
+
+Generated from actual API execution against the live server (not mocked):
+
+| Artifact | Content | Purpose |
+|----------|---------|---------|
+| `all_test_requests.json` | Input payloads for all 186 tests | Reproducing test scenarios |
+| `all_test_responses.json` | Full API responses for all 186 tests | Response structure verification |
+| `validation_results.json` | Per-test validation outcomes | Invariant compliance auditing |
+| `failed_validations.json` | Tests with validation failures (empty = all pass) | Regression tracking |
+| `summary_report.md` | Aggregate results and category breakdown | Quick review reference |
 
 ```bash
 # Start server, then run tests
 python test_all.py
 
-# Expected output:
-# RESULTS: 180/180 passed | 0/180 failed
+# Generate validation artifacts
+# python test_artifacts/generate.py
 ```
 
 ---
