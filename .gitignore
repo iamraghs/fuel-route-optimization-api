@@ -191,3 +191,5 @@ target/
 .dmypy.json
 dmypy.json
 
+test_artifacts/
+_audit.py
