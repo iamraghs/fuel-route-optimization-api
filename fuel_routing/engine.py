@@ -848,7 +848,7 @@ class FuelRouteOptimizationEngine:
                 'fuel_purchased_at_stops': round(fuel_purchased_total, 1),
                 'total_fuel_available': round(VEHICLE_TANK + fuel_purchased_total, 1),
                 'total_fuel_consumed_gallons': round(actual_fuel_consumed, 1),
-                'fuel_remaining_at_destination': round(fuel_remaining_val, 1),
+                'fuel_remaining_at_destination': max(0.0, round(fuel_remaining_val, 1)),
             }
         }
 
