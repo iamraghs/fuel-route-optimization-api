@@ -15,7 +15,7 @@ from django.core.cache import cache
 from .cache_utils import (
     CorridorStationCache,
 )
-from .cache_service import get_cached_optimization, set_cached_optimization
+from .cache_service import get_cached_optimization, get_or_compute_optimization, set_cached_optimization
 from .constants import (
     GOOGLE_API_KEY, VEHICLE_MAX_RANGE, VEHICLE_MPG, VEHICLE_TANK,
     MIN_DESTINATION_RESERVE_GALLONS,
@@ -143,25 +143,20 @@ class FuelRouteOptimizationEngine:
             # Get active price version (cached in-process to avoid repeated DB queries)
             pv = _get_active_price_version()
 
-            # Check unified optimization cache first (Redis, price-version-aware)
+            # Attempt lightweight cache check first (fast path)
             cached_result = get_cached_optimization(start_input, end_input, price_version=pv)
             if cached_result is not None:
-                # Deep copy to prevent in-place mutation of cached object
-                # (LocMemCache returns references; Redis serializes so this is a no-op there)
+                # Deep copy prevents in-place mutation of cached object
                 cached_result = copy.deepcopy(cached_result)
-                # Add per-request fields (not stored in cache)
                 elapsed_ms = int((time.time() - start_time) * 1000)
                 cached_result['optimization_time_ms'] = elapsed_ms
                 cached_result['request_id'] = request_id
-                # Backward compat: ensure new fields exist on older cached responses
                 cached_result.setdefault('route_feasible', True)
                 cached_result.setdefault('optimization_confidence', 'cached')
                 _cache_hit_counters['optimization'] = _cache_hit_counters.get('optimization', 0) + 1
                 global _request_counter
                 _request_counter += 1
-                logger.info(
-                    f"[{request_id}] Optimization cache HIT in {elapsed_ms}ms"
-                )
+                logger.info(f"[{request_id}] Optimization cache HIT in {elapsed_ms}ms")
                 if _request_counter % _STATS_LOG_INTERVAL == 0:
                     logger.info(
                         f"[STATS] requests={_request_counter} "
@@ -210,27 +205,35 @@ class FuelRouteOptimizationEngine:
             if not routes:
                 raise ValueError("No routes found from Google API")
 
-            # Short route fast-path
-            primary_route = routes[0]
-            if primary_route.distance_miles <= VEHICLE_MAX_RANGE:
-                result = FuelRouteOptimizationEngine._short_route_path(
-                    routes, start_input, end_input, start_loc, end_loc,
+            # Define optimization compute (used by coalesced cache below)
+            def _compute_optimization_internal():
+                """Run optimization and return result (called at most once under lock)."""
+                primary_route = routes[0]
+                if primary_route.distance_miles <= VEHICLE_MAX_RANGE:
+                    return FuelRouteOptimizationEngine._short_route_path(
+                        routes, start_input, end_input, start_loc, end_loc,
+                        start_city, start_state, start_formatted,
+                        end_city, end_state, end_formatted,
+                        request_id, start_time
+                    )
+                return FuelRouteOptimizationEngine._standard_optimization_path(
+                    routes, start_input, end_input,
+                    start_loc, end_loc,
                     start_city, start_state, start_formatted,
                     end_city, end_state, end_formatted,
-                    request_id, start_time
+                    request_id, start_time, pv
                 )
-                # Cache short-route results too (they don't depend on station data)
-                set_cached_optimization(start_input, end_input, result, price_version=pv)
-                return result
 
-            # Standard optimization path
-            return FuelRouteOptimizationEngine._standard_optimization_path(
-                routes, start_input, end_input,
-                start_loc, end_loc,
-                start_city, start_state, start_formatted,
-                end_city, end_state, end_formatted,
-                request_id, start_time, pv
+            # Coalesced optimization with stampede protection.
+            # The compute_fn runs at most once per cache key. Concurrent requests
+            # for the same inputs wait for and reuse the cached result.
+            result = get_or_compute_optimization(
+                start_input, end_input, pv,
+                compute_fn=_compute_optimization_internal,
             )
+            if result is None:
+                raise ValueError("Optimization failed")
+            return result
 
         except Exception as e:
             logger.error(f"[{request_id}] Optimization failed: {e}")

@@ -3,16 +3,17 @@ Unified cache service for optimization results.
 
 Provides a single, consistent cache layer for final optimization responses.
 Uses normalized, versioned keys (price-version-aware) for deterministic caching.
+Includes request coalescing to prevent duplicate expensive computations.
 
 Key format:  fuel_routing:optimization:v1:{input_hash}:pv{price_version}
 """
 import hashlib
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from django.core.cache import cache
 
-from .cache_utils import RouteNormalizer
+from .cache_utils import AtomicCacheOps, RouteNormalizer
 
 logger = logging.getLogger(__name__)
 
@@ -96,4 +97,48 @@ def set_cached_optimization(
         logger.warning(f"Unified cache write failed: {e}")
 
 
+def get_or_compute_optimization(
+    start_input: str | Dict[str, float],
+    end_input: str | Dict[str, float],
+    price_version: int,
+    compute_fn: Callable[[], Dict[str, Any]],
+    ttl: int = OPTIMIZATION_TTL,
+) -> Optional[Dict[str, Any]]:
+    """Get cached optimization or compute atomically with request coalescing.
 
+    Prevents cache stampede: when multiple requests arrive simultaneously
+    for the same route with the same price version, only one computes;
+    the rest wait for and reuse the cached result.
+
+    Args:
+        start_input: Start location.
+        end_input: End location.
+        price_version: Active price version ID.
+        compute_fn: Function that computes the optimization result.
+        ttl: Cache TTL in seconds.
+
+    Returns:
+        Cached or computed optimization result with _cache_hit set,
+        or None if the computation failed.
+    """
+    cache_hash = _make_optimization_cache_key(start_input, end_input, price_version)
+    redis_key = _redis_key(cache_hash)
+    lock_key = f"{redis_key}:lock"
+
+    def cache_wrapper():
+        result = compute_fn()
+        to_cache = dict(result)
+        to_cache.pop("_cache_hit", None)
+        return to_cache
+
+    result = AtomicCacheOps.get_or_compute(
+        cache_key=redis_key,
+        compute_fn=cache_wrapper,
+        ttl=ttl,
+        lock_key=lock_key,
+    )
+
+    if result is not None and isinstance(result, dict):
+        result["_cache_hit"] = True
+
+    return result
