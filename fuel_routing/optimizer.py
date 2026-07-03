@@ -48,6 +48,7 @@ class FuelStopDetail:
 # In-process cache: {price_version_id: avg_price}
 _avg_price_cache: Dict[int, float] = {}
 _AVG_PRICE_CACHE_MAX = 10  # prevent unbounded growth (only 1-2 expected)
+_RESERVE_GALLONS = VEHICLE_RESERVE_MILES / VEHICLE_MPG  # 50mi / 10mpg = 5 gallons
 
 
 def get_cached_avg_price(price_version_id: int, force: bool = False) -> float:
@@ -236,7 +237,7 @@ class FuelOptimizer:
         logger.info(f"Optimizing fuel stops for {route.route_id} ({route.distance_miles:.1f} miles)")
 
         # Precompute route distances
-        all_coords, cum_distances, sampled_coords, sampled_cum_dist = \
+        all_coords, cum_distances, _, _ = \
             FuelOptimizer.precompute_route_distances(route.polyline_encoded) \
             if route.polyline_encoded else ([], [], [], [])
 
@@ -288,6 +289,10 @@ class FuelOptimizer:
 
         total_fuel_purchased = 0.0
 
+        # Pre-compute loop-invariant range values
+        full_tank_range = float(VEHICLE_TANK) * VEHICLE_MPG
+        full_tank_effective_range = full_tank_range - VEHICLE_RESERVE_MILES
+
         iteration = 0
         estimated_stops_needed = max(1, int(route.distance_miles / VEHICLE_MAX_RANGE) + 2)
         max_iterations = max(100, min(200, estimated_stops_needed * 20))
@@ -335,7 +340,7 @@ class FuelOptimizer:
 
                 fuel_needed_to_reach = effective_distance / VEHICLE_MPG
 
-                max_fuel_for_travel = current_fuel - (VEHICLE_RESERVE_MILES / VEHICLE_MPG)
+                max_fuel_for_travel = current_fuel - _RESERVE_GALLONS
                 if fuel_needed_to_reach > max_fuel_for_travel:
                     continue
 
@@ -366,10 +371,8 @@ class FuelOptimizer:
             selected_strategy = None
             target_cheaper = None
 
-            # Effective ranges for decision making
+            # Effective range from current position (changes with each stop)
             current_effective_range = current_fuel * VEHICLE_MPG - VEHICLE_RESERVE_MILES
-            full_tank_range = float(VEHICLE_TANK) * VEHICLE_MPG
-            full_tank_effective_range = full_tank_range - VEHICLE_RESERVE_MILES
 
             for candidate in candidates:
                 station_distance = candidate['distance_from_start']

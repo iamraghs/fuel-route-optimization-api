@@ -31,7 +31,8 @@ def health_check(request):
         }
     except Exception as e:
         status = "degraded"
-        checks['database'] = {'status': 'error', 'detail': str(e)}
+        checks['database'] = {'status': 'error', 'detail': 'Connection failed'}
+        logger.error(f"Health check database failure: {e}")
 
     # Cache connectivity
     try:
@@ -40,7 +41,8 @@ def health_check(request):
         checks['cache'] = {'status': 'ok'}
     except Exception as e:
         status = "degraded"
-        checks['cache'] = {'status': 'error', 'detail': str(e)}
+        checks['cache'] = {'status': 'error', 'detail': 'Connection failed'}
+        logger.error(f"Health check cache failure: {e}")
 
     elapsed_ms = int((time.time() - start) * 1000)
 

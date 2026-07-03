@@ -34,11 +34,12 @@ EXPECTED ISSUES IN RAW DATA:
 """
 
 import csv
+import hashlib
 import logging
 import re
 from decimal import Decimal
 from typing import List, Dict, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -491,17 +492,17 @@ class DataNormalizer(PreprocessingStep):
                 # State already uppercase from step 2
                 record['normalized_state'] = record['state']
                 
-                # Create deterministic station hash
+                # Create deterministic station hash (MD5 for cross-run reproducibility)
                 hash_input = (
                     f"{record['opis_id']}"
                     f"{record['normalized_address'].lower()}"
                     f"{record['normalized_city'].lower()}"
                     f"{record['normalized_state']}"
-                )
-                record['station_hash'] = hash(hash_input) & 0xffffffff
+                ).encode()
+                record['station_hash'] = int(hashlib.md5(hash_input).hexdigest()[:8], 16)
                 
                 # Add preprocessing metadata
-                record['preprocessed_at'] = datetime.utcnow().isoformat()
+                record['preprocessed_at'] = datetime.now(timezone.utc).isoformat()
                 record['quality_score'] = self._calculate_quality_score(record)
                 record['is_geocoded'] = False  # Will be filled after geocoding
                 record['latitude'] = None
@@ -718,7 +719,7 @@ class PreprocessingPipeline:
             'clean_records': len(records),
             'rejected_records': len(self.all_rejected),
             'success_rate': (len(records)/(len(records)+len(self.all_rejected))*100),
-            'timestamp': datetime.utcnow().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
         
         return records, stats

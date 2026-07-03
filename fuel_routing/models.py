@@ -27,7 +27,6 @@ Performance Focus:
 from django.db import models
 from django.contrib.gis.db import models as gis_models
 from django.contrib.gis.geos import Point
-from django.contrib.postgres.indexes import GistIndex
 from django.core.validators import MinValueValidator, MaxValueValidator
 from django.utils import timezone
 from decimal import Decimal
@@ -160,13 +159,6 @@ class FuelStation(models.Model):
     class Meta:
         # CRITICAL INDEXES FOR PERFORMANCE
         indexes = [
-            # PostGIS GIST index for ST_DWithin corridor queries
-            GistIndex(
-                fields=['location_point'],
-                name='idx_fuel_station_geo_point',
-                condition=models.Q(location_point__isnull=False),
-            ),
-            # Spatial indexes (note: GIST indexes created via migration)
             # State + City for corridor queries
             models.Index(
                 fields=['state', 'city'],
@@ -200,7 +192,7 @@ class FuelStation(models.Model):
         return (float(self.latitude), float(self.longitude))
 
     def save(self, *args, **kwargs):
-        if self.latitude is not None and self.longitude is not None and self.location_point is None:
+        if self.latitude is not None and self.longitude is not None:
             self.location_point = Point(
                 float(self.longitude), float(self.latitude), srid=4326
             )

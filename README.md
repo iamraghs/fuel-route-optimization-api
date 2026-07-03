@@ -256,7 +256,7 @@ qs = FuelStation.objects.filter(
 ```
 
 - `ST_DWithin` on `PointField` with `geography=True` (geodetic distance calculation in meters)
-- GIST index on `location_point` (conditional on `IS NOT NULL`) provides logarithmic spatial selectivity
+- GIST index on `location_point` provides logarithmic spatial selectivity
 - `opis_id__in` pre-filter bounds the candidate set to only stations with current prices (the bottleneck is priced stations, not total station count)
 
 ### Fallback Path
