@@ -68,7 +68,7 @@ The system must evaluate multiple route alternatives, select station stops, dete
 - **Multi-route cost optimization**: independent optimization of up to 2 Google route alternatives with cost-minimizing selection
 - **Greedy + lookahead fuel strategy**: range-aware station selection with future-price lookahead and partial fueling
 - **Versioned cache invalidation**: price-version-keyed optimization cache eliminates stale-price responses without explicit invalidation
-- **PostGIS corridor filtering**: ST_DWithin with GIST index for spatial station queries (logarithmic, not linear)
+- **PostGIS corridor filtering**: distance-adaptive ST_DWithin with GIST index for spatial station queries (logarithmic, not linear)
 - **Cross-track distance snapping**: perpendicular distance to polyline segments eliminates false station rejection from sparse Google coordinate data
 - **Production-grade unreachable detection**: mathematically proven invariant that successful routes always have positive available fuel
 
@@ -112,7 +112,7 @@ api.py (DRF endpoint)
 | Max range (full tank) | 500 miles | `VEHICLE_MAX_RANGE` |
 | Reserve buffer | 50 miles (5 gallons) | `VEHICLE_RESERVE_MILES` |
 | Max detour per stop | 5 miles (round-trip) | `MAX_DETOUR_MILES` |
-| Corridor search radius | 50 miles | `CORRIDOR_BUFFER_MILES` |
+| Corridor search radius | 10–50 miles (adaptive) | `CORRIDOR_BUFFER_MILES` (max) |
 | Minimum purchase | 5 gallons | (hardcoded in optimizer) |
 
 ---
@@ -258,6 +258,7 @@ qs = FuelStation.objects.filter(
 - `ST_DWithin` on `PointField` with `geography=True` (geodetic distance calculation in meters)
 - GIST index on `location_point` provides logarithmic spatial selectivity
 - `opis_id__in` pre-filter bounds the candidate set to only stations with current prices (the bottleneck is priced stations, not total station count)
+- Corridor buffer scales with route distance: `min(50, max(10, 10 + distance × 0.005))` miles — tighter for short routes, wider for long routes, always at least 2× the optimizer's 5-mile detour limit
 
 ### Fallback Path
 
@@ -495,14 +496,14 @@ Routes travel time is not modeled. The detour penalty uses Euclidean (haversine)
 | **Benefit** | Avoids ~50% additional computation per route without meaningful improvement in selection quality |
 | **Limitation** | If Google returns only 1 alternative, the comparison is limited to a single route |
 
-### Fixed 50-Mile Corridor
+### Adaptive Corridor Sizing
 
 | | |
 |---|---|
-| **Decision** | Fixed 50-mile buffer for PostGIS corridor queries |
-| **Reason** | Station density along US interstates ensures all usable stations fall within 50 miles of the route. Maximum detour per station is 5 miles |
-| **Benefit** | Simple, predictable, captures all relevant stations |
-| **Limitation** | 80-95% of loaded stations are discarded by the 5-mile detour filter. Corridor could be tightened to 10-25 miles based on route distance without losing usable stations |
+| **Decision** | Distance-adaptive corridor: `min(50, max(10, 10 + distance × 0.005))` miles |
+| **Reason** | Optimizer discards stations with `detour > 5` miles. A fixed 50-mile buffer loads 5-10× more stations than the optimizer can use. Adaptive sizing reduces waste while preserving all usable stations |
+| **Benefit** | Short routes (under 1000mi) use 10-15mi buffer, loading ~75% fewer stations. Long routes (over 3000mi) get wider buffer to compensate for polyline coarseness. Cache keys include buffer size, so different buffers don't collide |
+| **Limitation** | At 10mi minimum, approximately 60-80% of loaded stations are still discarded by the 5-mile detour filter on short routes. Further tightening would risk excluding stations near the detour boundary on curved roads |
 
 ### Cross-Track Distance over Nearest-Point
 
@@ -806,7 +807,7 @@ Vehicle and optimization parameters in `constants.py` (all configurable via Djan
 | `VEHICLE_FUEL_TANK_CAPACITY` | 50 | Gallons |
 | `VEHICLE_MAX_RANGE` | 500 | Miles (tank × MPG) |
 | `VEHICLE_RESERVE_RANGE_MILES` | 50 | Reserve buffer |
-| `FUEL_STOP_CORRIDOR_BUFFER_MILES` | 50 | PostGIS corridor width |
+| `FUEL_STOP_CORRIDOR_BUFFER_MILES` | 50 | PostGIS corridor max width (adaptive: 10–50mi) |
 | `FUEL_STOP_MAX_DETOUR_MILES` | 5 | Maximum station detour |
 
 ---
