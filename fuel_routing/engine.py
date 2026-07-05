@@ -396,7 +396,9 @@ class FuelRouteOptimizationEngine:
         # OPTIMIZED: Per-route PostGIS corridor query with automatic fallback
         def _load_route_stations(route):
             """Load stations for a route using PostGIS corridor query (with fallback)."""
-            cached_ids = CorridorStationCache.get(route.route_id, CORRIDOR_BUFFER_MILES, route.polyline_encoded or '')
+            # Adaptive corridor: 2x detour limit (10mi) + 5mi per 1000mi of route
+            corridor_miles = min(50.0, max(10.0, 10.0 + route.distance_miles * 0.005))
+            cached_ids = CorridorStationCache.get(route.route_id, corridor_miles, route.polyline_encoded or '')
             if cached_ids is not None:
                 db_stations = FuelStation.objects.filter(
                     opis_id__in=list(cached_ids), is_active=True
@@ -425,7 +427,7 @@ class FuelRouteOptimizationEngine:
                         qs = FuelStation.objects.filter(
                             is_active=True,
                             opis_id__in=opis_ids_with_prices,
-                            location_point__dwithin=(route_line, D(mi=CORRIDOR_BUFFER_MILES)),
+                            location_point__dwithin=(route_line, D(mi=corridor_miles)),
                         ).values(
                             'opis_id', 'name', 'address', 'city', 'state', 'latitude', 'longitude'
                         )
@@ -438,7 +440,7 @@ class FuelRouteOptimizationEngine:
                                 s['longitude'] = float(s['longitude'])
                                 result.append(s)
                         CorridorStationCache.set(
-                            route.route_id, CORRIDOR_BUFFER_MILES,
+                            route.route_id, corridor_miles,
                             [s['opis_id'] for s in result],
                             route.polyline_encoded or ''
                         )
@@ -484,7 +486,7 @@ class FuelRouteOptimizationEngine:
                             st['longitude'] = float(st['longitude'])
                             route_bbox_stations.append(dict(st))
                     return FuelStationQueryService.filter_stations_by_route(
-                        route, route_bbox_stations
+                        route, route_bbox_stations, corridor_miles
                     ) if route_bbox_stations else []
             except Exception as e:
                 logger.warning(f"[{request_id}] Fallback station query failed: {e}")
