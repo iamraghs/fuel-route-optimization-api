@@ -115,6 +115,7 @@ class GeometryCache:
 
 CORRIDOR_CACHE_PREFIX = "fuel_routing:corridor:v1"
 CORRIDOR_CACHE_TTL = 3600  # 1 hour (station sets stable; price changes don't affect which stations exist)
+_STATION_VERSION_KEY = "fuel_routing:station:version"
 
 
 class CorridorStationCache:
@@ -127,14 +128,40 @@ class CorridorStationCache:
     route_id is reused across requests (route_a / route_b), so without the
     polyline discriminator, cached station IDs from one start→end pair could
     be served for a different route with the same letter label.
+
+    Station version suffix (sv{N}) enables immediate visibility of new/updated
+    stations: when a FuelStation is inserted or modified, bump_station_version()
+    should be called, causing all subsequent corridor cache lookups to miss
+    and recompute with fresh data.
     """
+
+    @staticmethod
+    def _get_station_version() -> int:
+        """Get current station data version from Redis."""
+        try:
+            return cache.get(_STATION_VERSION_KEY) or 0
+        except Exception:
+            return 0
+
+    @staticmethod
+    def bump_station_version() -> None:
+        """Increment station version to invalidate all corridor caches.
+
+        Call after FuelStation insert, update, or delete so that
+        subsequent corridor queries recompute with fresh station data.
+        """
+        try:
+            cache.incr(_STATION_VERSION_KEY)
+        except Exception:
+            cache.set(_STATION_VERSION_KEY, 1)
 
     @staticmethod
     def _make_key(route_id: str, buffer_miles: float, polyline: str = '') -> str:
         discriminator = ''
         if polyline:
             discriminator = ':' + hashlib.md5(polyline.encode()).hexdigest()[:12]
-        return f"{CORRIDOR_CACHE_PREFIX}:{route_id}{discriminator}:buf{int(buffer_miles)}"
+        station_ver = CorridorStationCache._get_station_version()
+        return f"{CORRIDOR_CACHE_PREFIX}:{route_id}{discriminator}:buf{int(buffer_miles)}:sv{station_ver}"
 
     @staticmethod
     def get(route_id: str, buffer_miles: float, polyline: str = '') -> Optional[List[int]]:

@@ -212,7 +212,7 @@ All route alternatives are processed independently through the full optimization
 | Optimization | Redis | `fuel_routing:optimization:v1:{input_hash}:pv{version}` | 1 hour | Price version change (key mismatch) |
 | Route geometry | PostgreSQL `RouteCache` | `fuel_routing:route:v1:{coord_hash}` | 24 hours | TTL expiry |
 | Geocode | Redis | `fuel_routing:geocode:v1:{address_hash}` | 7 days | TTL expiry |
-| Corridor stations | Redis | `fuel_routing:corridor:v1:{id}:{polyline_hash}:buf{mi}` | 1 hour | TTL expiry |
+| Corridor stations | Redis | `fuel_routing:corridor:v1:{id}:{polyline_hash}:buf{mi}:sv{ver}` | 1 hour | Station version change (key mismatch) |
 | Polyline geometry | In-process `OrderedDict` (max 200) | Polyline MD5 | Process lifetime | LRU eviction + Redis version check |
 | Price version | In-process (30s) + Redis (60s) | `price_version:active` | 30s / 60s | Explicit publish |
 
@@ -227,7 +227,7 @@ The following caches do NOT include price version and are unaffected by price ch
 - Corridor station sets (keyed by route polyline)
 - Polyline geometry (keyed by polyline content)
 
-This separation is intentional: station locations do not change when fuel prices do.
+This separation is intentional: station locations do not change when fuel prices do. When station data itself changes (new station added, coordinates updated, activation status changed), the corridor station cache receives a bumped version suffix (`sv{N}`), causing a natural cache miss on the next query without requiring explicit cache deletion or global invalidation.
 
 ### Request Coalescing
 
@@ -550,6 +550,7 @@ Routes travel time is not modeled. The detour penalty uses Euclidean (haversine)
 - **Request tracing**: 20+ log points per request carry a unique `request_id` prefix, enabling log correlation across geocoding, routing, and optimization stages.
 - **Rate limiting**: DRF `AnonRateThrottle` (1000 requests/hour) prevents abuse.
 - **Unreachable detection**: Routes with `available_fuel < required_fuel` return `status: "unreachable"` instead of a fake successful response with negative fuel remaining.
+- **Station change visibility**: Corridor cache keys include a station version suffix (`:sv{N}`). FuelStation signals auto-increment the version on insert/update/delete, making new stations immediately visible to optimization without explicit cache invalidation.
 
 ### Not Implemented (Infrastructure-Level)
 
