@@ -248,10 +248,11 @@ Applied to: geocoding, route fetching, optimization computation.
 ### Corridor Query
 
 ```python
+corridor_miles = min(50.0, max(10.0, 10.0 + route.distance_miles * 0.005))
 qs = FuelStation.objects.filter(
     is_active=True,
     opis_id__in=opis_ids_with_prices,       # pre-filter to ~5000 priced stations
-    location_point__dwithin=(route_line, D(mi=CORRIDOR_BUFFER_MILES)),
+    location_point__dwithin=(route_line, D(mi=corridor_miles)),
 )
 ```
 
@@ -350,11 +351,13 @@ When `available_fuel_gallons < required_fuel_gallons` (with -0.1 gallon floating
   "selected_route": {
     "route_id": "route_a",
     "distance_miles": 2479.8,
-    "is_optimal": false,
+    "is_optimal": null,
     "reason": "Unable to complete route",
-    "warning": "Insufficient station coverage for complete optimization. Route cannot be completed."
+    "estimated_total_fuel_consumption_gallons": null,
+    "estimated_total_fuel_cost": null,
+    "fuel_stops_required": null
   },
-  "warning": "Route cannot be completed",
+  "warning": "Insufficient station coverage for complete optimization. Route cannot be completed.",
   "fuel_stops": [],
   "trip_summary": {
     "total_distance_miles": 2479.8,
@@ -776,24 +779,29 @@ python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# Database (PostgreSQL 14+ with PostGIS 3.2+)
+# Initialize database (PostgreSQL 14+ with PostGIS 3.2+)
 createdb fuel_routing_dev
 psql fuel_routing_dev -c "CREATE EXTENSION postgis;"
 python manage.py migrate
+
+# Preprocess station CSV (outputs fuel_prices_cleaned.csv)
 python manage.py preprocess_fuel_data
-python manage.py load_fuel_data fuel_prices_cleaned.csv
 
 # Environment
 export GOOGLE_MAPS_API_KEY=your_key_here
+export DB_NAME=fuel_routing_dev
+export DB_USER=postgres
+export DB_PASSWORD=postgres
+export DB_HOST=localhost
+export DB_PORT=5432
 export REDIS_ENABLED=False
-export DATABASE_URL=postgis://user:pass@localhost:5432/fuel_routing_dev
 
-# Development
+# Run development server
 python manage.py runserver
 
 # Production
-gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4
 export REDIS_ENABLED=True
+gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4
 ```
 
 ---
@@ -834,6 +842,6 @@ fuel_routing/
   preprocessing.py    — CSV preprocessing pipeline (10 stages, 5141 stations)
 config/
   settings.py         — Django settings, cache configuration, throttle rates
-test_all.py           — 180-route integration test suite
+test_all.py           — 186-case integration test suite
 ```
 
