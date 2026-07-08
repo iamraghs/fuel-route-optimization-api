@@ -8,7 +8,6 @@ VEHICLE_RESERVE_MILES = settings.VEHICLE_RESERVE_RANGE_MILES  # 50 miles
 
 CORRIDOR_BUFFER_MILES = settings.FUEL_STOP_CORRIDOR_BUFFER_MILES  # 50 miles
 MAX_DETOUR_MILES = settings.FUEL_STOP_MAX_DETOUR_MILES            # 5 miles
-LOOKAHEAD_MILES = settings.FUEL_OPTIMIZATION_LOOKAHEAD_MILES      # 200 miles
 
 MIN_DESTINATION_RESERVE_GALLONS = 5  # Minimum fuel remaining at destination (safety reserve)
 

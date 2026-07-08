@@ -19,7 +19,6 @@ from .cache_service import get_cached_optimization, get_or_compute_optimization,
 from .constants import (
     GOOGLE_API_KEY, VEHICLE_MAX_RANGE, VEHICLE_MPG, VEHICLE_TANK,
     MIN_DESTINATION_RESERVE_GALLONS,
-    CORRIDOR_BUFFER_MILES,
 )
 from .geocoding import GeocodingService, Location
 from .models import FuelPrice, FuelStation, PriceVersion
