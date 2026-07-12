@@ -561,6 +561,24 @@ Metrics aggregation (Prometheus), structured alerting, and automated deployment 
 
 ---
 
+## API Versioning Strategy
+
+The API exposes a single stable endpoint (`POST /route/fuel-optimization/`) without URL-based versioning. This is an intentional design choice for the current scope:
+
+- **Single consumer**: The API serves one internal client (the route optimization front-end). There are no public-facing API consumers requiring version coexistence.
+- **No backward-incompatible changes**: The response schema has remained stable throughout development. Adding new fields does not require a version bump.
+- **Minimal routing overhead**: Skipping `/v1/` URL prefixes avoids unnecessary indirection for a single-endpoint API.
+
+The architecture is compatible with future versioning without major refactoring:
+
+- **URL prefix versioning**: Adding a `v1` prefix to the URL pattern in `config/urls.py` requires no changes to application code — the view functions and serializers are self-contained.
+- **Header negotiation**: The DRF view could alternatively accept version via `Accept` header without URL changes.
+- **Serializer separation**: Each response serializer (`SelectedRouteSerializer`, `TripSummarySerializer`, etc.) is independent, allowing version-specific serializers if the schema diverges.
+
+API versioning will be introduced only if backward-incompatible changes or multiple public API versions become necessary. The `RouteRequest.api_version` audit field (default `'1.0'`) is already in place for tracing which API version generated each response.
+
+---
+
 ## Observability
 
 Each request carries a unique `request_id` logged as `[{request_id}]` prefix across all subsystems:
