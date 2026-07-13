@@ -286,7 +286,6 @@ class FuelRouteOptimizationEngine:
                 'estimated_total_fuel_consumption_gallons': round(estimated_fuel, 1),
                 'estimated_total_fuel_cost': float(estimated_cost),
                 'fuel_stops_required': 0,
-                'route_polyline': best_route.polyline_encoded,
                 'route_map_link': route_map_link,
             },
             'route_comparison': [
@@ -810,7 +809,6 @@ class FuelRouteOptimizationEngine:
                     estimated_fuel_cost if infeasible else response_total_cost
                 ),
                 'fuel_stops_required': len(selected_stops),
-                'route_polyline': selected_route.polyline_encoded,
                 'route_map_link': route_map_link,
                 'warning': (
                     'No fuel stations found in database for this route corridor. '

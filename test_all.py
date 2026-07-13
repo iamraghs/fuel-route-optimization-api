@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Comprehensive 50-test-case validator for Fuel Route Optimization API."""
+"""Comprehensive 180-test-case validator for Fuel Route Optimization API."""
 import json
 import subprocess
 import time
