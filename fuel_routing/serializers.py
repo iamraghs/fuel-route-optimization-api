@@ -10,7 +10,7 @@ from rest_framework import serializers
 class RequestLocationSerializer(serializers.Serializer):
     """Request location info (for UI display)."""
     city = serializers.CharField(max_length=100)
-    state = serializers.CharField(max_length=2)
+    state = serializers.CharField(max_length=32)
     formatted_address = serializers.CharField(max_length=255)
 
 
@@ -195,6 +195,14 @@ class FuelOptimizationRequestSerializer(serializers.Serializer):
             if lng is None:
                 lng = value.get('longitude')
             if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+                if not (-90.0 <= lat <= 90.0):
+                    raise serializers.ValidationError(
+                        "Latitude must be between -90 and 90."
+                    )
+                if not (-180.0 <= lng <= 180.0):
+                    raise serializers.ValidationError(
+                        "Longitude must be between -180 and 180."
+                    )
                 return value
         raise serializers.ValidationError("Must be address string or {'lat': x, 'lng': y}")
 
@@ -214,6 +222,14 @@ class FuelOptimizationRequestSerializer(serializers.Serializer):
             if lng is None:
                 lng = value.get('longitude')
             if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+                if not (-90.0 <= lat <= 90.0):
+                    raise serializers.ValidationError(
+                        "Latitude must be between -90 and 90."
+                    )
+                if not (-180.0 <= lng <= 180.0):
+                    raise serializers.ValidationError(
+                        "Longitude must be between -180 and 180."
+                    )
                 return value
         raise serializers.ValidationError("Must be address string or {'lat': x, 'lng': y}")
 

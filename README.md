@@ -337,6 +337,7 @@ Reverse geocoding runs once per unique coordinate pair and reuses cached values 
 | LocMemCache in-place mutation | `copy.deepcopy()` before per-request field writes | Optimization cache read path |
 | Perpendicular station distance | Cross-track formula recovers stations between sparse polyline points | Fuel optimizer snap function |
 | `{"lat": "abc", "lng": "def"}` coordinate abuse | Type-checked at serializer level; returns 400 | Request serializer |
+| `{"lat": 999, "lng": 0}` out-of-range coordinates | Range-checked at serializer level (-90..90, -180..180); returns 400 | Request serializer |
 | 50000-character address string | max_length=1024 check; returns 400 | Request serializer |
 | Latitude = 0, longitude = 0 (equator) | Explicitly handled via `is None` check (not `or` falsy) | Request serializer + location resolver |
 
