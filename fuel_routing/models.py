@@ -373,12 +373,12 @@ class PriceVersion(models.Model):
       • Expiration tracking for cleanup
     
     CACHE INVALIDATION:
-      1. New version published
-      2. Event published: price_version_updated
-      3. All apps receive event
-      4. Delete optimization_cache entries for old version
-      5. Delete Redis price keys for old version
-      6. Set current version atomically
+      • Optimization cache key includes price version ID
+      • Publishing a new version changes the active version ID
+      • Subsequent requests compute a different cache key -> automatic cache miss
+      • No explicit cache deletion is required
+      • Route geometry cache and corridor cache are unaffected
+      • (prices change, station locations do not)
     """
     
     # VERSION IDENTIFICATION
@@ -502,7 +502,7 @@ class RouteCache(models.Model):
       • Reusable across requests
       • Avoids repeated Google API calls
       • <3ms cache hit lookup
-      • Stored in Redis (24-hour TTL)
+      • Stored in PostgreSQL RouteCache table (24-hour TTL expiry)
     
     DESIGN:
       • Immutable after creation
