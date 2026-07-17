@@ -209,7 +209,7 @@ All route alternatives are processed independently through the full optimization
 
 | Cache Layer | Storage | Key Format | TTL | Invalidated By |
 |-------------|---------|------------|-----|----------------|
-| Optimization | Redis | `fuel_routing:optimization:v1:{input_hash}:pv{version}` | 1 hour | Price version change (key mismatch) |
+| Optimization | Redis | `fuel_routing:optimization:v1:{input_hash}:pv{version}:sv{station_ver}` | 1 hour | Price version or station version change (key mismatch) |
 | Route geometry | PostgreSQL `RouteCache` | `fuel_routing:route:v1:{coord_hash}` | 24 hours | TTL expiry |
 | Geocode | Redis | `fuel_routing:geocode:v1:{address_hash}` | 7 days | TTL expiry |
 | Corridor stations | Redis | `fuel_routing:corridor:v1:{id}:{polyline_hash}:buf{mi}:sv{ver}` | 1 hour | Station version change (key mismatch) |
@@ -804,6 +804,9 @@ psql fuel_routing_dev -c "CREATE EXTENSION postgis;"
 python manage.py migrate
 
 # Preprocess station CSV (outputs fuel_prices_cleaned.csv)
+# Note: This only cleans the CSV — it does NOT insert stations into the database.
+# The cleaned CSV contains address data and a geocode_query field, but no coordinates.
+# Stations must be loaded separately (see "Loading Station Data" below).
 python manage.py preprocess_fuel_data
 
 # Environment
@@ -824,6 +827,19 @@ gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4
 ```
 
 ---
+
+### Loading Station Data
+
+The preprocessing pipeline (`preprocess_fuel_data`) cleans the raw CSV and outputs `fuel_prices_cleaned.csv`, but it does **not** insert stations into the database. The FuelStation and FuelPrice tables must be populated separately.
+
+Station data can be loaded by:
+
+1. **Batch geocoding:** Read `fuel_prices_cleaned.csv`, call the Google Geocoding API for each `geocode_query`, create FuelStation records with the returned coordinates, create FuelPrice records with the `retail_price`, and create an active PriceVersion.
+2. **Direct insert:** If coordinates are already known, insert FuelStation and FuelPrice records directly.
+
+**Duplicate handling:** FuelStation has a `unique` constraint on `opis_id`. If the loaded CSV contains an `opis_id` that already exists in the database, the insert will fail with a duplicate key error. The solution is to either:
+- Truncate existing data before reloading, or
+- Use `update_or_create` to update prices for existing stations while skipping coordinate updates (coordinates rarely change).
 
 ## Configuration
 

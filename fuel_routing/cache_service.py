@@ -5,7 +5,7 @@ Provides a single, consistent cache layer for final optimization responses.
 Uses normalized, versioned keys (price-version-aware) for deterministic caching.
 Includes request coalescing to prevent duplicate expensive computations.
 
-Key format:  fuel_routing:optimization:v1:{input_hash}:pv{price_version}
+Key format:  fuel_routing:optimization:v1:{input_hash}:pv{price_version}:sv{station_version}
 """
 import hashlib
 import logging
@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, Optional
 
 from django.core.cache import cache
 
-from .cache_utils import AtomicCacheOps, RouteNormalizer
+from .cache_utils import AtomicCacheOps, CorridorStationCache, RouteNormalizer
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +32,11 @@ def _make_optimization_cache_key(
     Normalizes both address strings and coordinate dicts so that
     semantically identical inputs produce the same cache key.
     """
+    station_ver = CorridorStationCache._get_station_version()
     raw_key = (
         f"{PREFIX}:optimization:{VERSION}:"
         f"{_normalize_cache_input(start_input)}|{_normalize_cache_input(end_input)}"
-        f":pv{price_version}"
+        f":pv{price_version}:sv{station_ver}"
     )
     return hashlib.md5(raw_key.encode()).hexdigest()
 

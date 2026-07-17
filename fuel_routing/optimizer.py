@@ -168,7 +168,7 @@ class FuelOptimizer:
                     best_cum_dist = all_cum_dist[i]
                     if min_detour < 1e-10:
                         break
-                d2 = _fast_distance_miles(lat1, lon1, station_lat, station_lon)
+                d2 = _fast_distance_miles(lat2, lon2, station_lat, station_lon)
                 if d2 < min_detour:
                     min_detour = d2
                     best_cum_dist = all_cum_dist[i + 1]
