@@ -197,7 +197,6 @@ GOOGLE_ROUTES_API_REQUEST_TIMEOUT = 15
 VEHICLE_FUEL_EFFICIENCY = 10  # Miles per gallon (MPG)
 VEHICLE_FUEL_TANK_CAPACITY = 50  # Gallons (full tank)
 VEHICLE_MAX_RANGE = 500  # Miles (tank capacity × MPG)
-VEHICLE_RESERVE_FUEL_PERCENT = 0.10  # Keep 10% as buffer
 VEHICLE_RESERVE_RANGE_MILES = 50  # Reserve: 50 miles minimum
 
 # ============================================================================
@@ -205,11 +204,6 @@ VEHICLE_RESERVE_RANGE_MILES = 50  # Reserve: 50 miles minimum
 # ============================================================================
 FUEL_STOP_CORRIDOR_BUFFER_MILES = 50
 FUEL_STOP_MAX_DETOUR_MILES = 5
-FUEL_STOP_MIN_PRICE_DISCOUNT = 0.05
-FUEL_REFUELING_TIME_MINUTES = 15
-FUEL_OPTIMIZATION_LOOKAHEAD_MILES = 200
-FUEL_PRICE_REFRESH_HOURS = 1
-FUEL_ROUTE_CACHE_HOURS = 24
 
 # ============================================================================
 # CACHING CONFIGURATION (Redis-first architecture)
