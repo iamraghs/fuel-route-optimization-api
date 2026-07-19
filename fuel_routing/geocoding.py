@@ -8,7 +8,7 @@ import requests
 from django.core.cache import cache
 from django.utils import timezone
 
-from .cache_utils import EnhancedCacheKeyGenerator, RequestLockManager, RouteNormalizer
+from .cache_utils import EnhancedCacheKeyGenerator, RequestLockManager
 from .constants import GOOGLE_API_KEY, GOOGLE_GEOCODING_ENDPOINT, CACHE_TTL_GEOCODE
 from .models import GeocodeFailure
 from .route_geometry import _fast_distance_miles

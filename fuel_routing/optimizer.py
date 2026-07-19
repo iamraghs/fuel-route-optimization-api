@@ -413,6 +413,13 @@ class FuelOptimizer:
                         continue
                     if info['distance'] > station_distance + full_tank_effective_range:
                         continue
+                    # Apply same detour filters as candidate construction (lines 333-337)
+                    # to keep _station_index and candidates consistent.
+                    _st_idx_detour = station_route_data.get(oid, {}).get('detour_miles', 0.0)
+                    if _st_idx_detour > MAX_DETOUR_MILES:
+                        continue
+                    if _st_idx_detour > info['distance'] - station_distance:
+                        continue
                     if info['price'] < price:
                         if cheaper_ahead is None or info['price'] < cheaper_ahead['price']:
                             cheaper_ahead = {
