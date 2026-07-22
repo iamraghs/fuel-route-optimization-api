@@ -9,7 +9,7 @@ from django.core.cache import cache
 from django.utils import timezone
 
 from .cache_utils import EnhancedCacheKeyGenerator, RequestLockManager
-from .constants import GOOGLE_API_KEY, GOOGLE_GEOCODING_ENDPOINT, CACHE_TTL_GEOCODE
+from .constants import GOOGLE_API_KEY, GOOGLE_GEOCODING_ENDPOINT, CACHE_TTL_GEOCODE, GOOGLE_API_TIMEOUT
 from .models import GeocodeFailure
 from .route_geometry import _fast_distance_miles
 
@@ -59,7 +59,7 @@ class GeocodingService:
                         'region': 'us',
                         'components': 'country:US'
                     },
-                    timeout=(5, 10)
+                    timeout=GOOGLE_API_TIMEOUT
                 )
                 response.raise_for_status()
 
@@ -134,7 +134,7 @@ class GeocodingService:
                         'key': GOOGLE_API_KEY,
                         'region': 'us',
                     },
-                    timeout=(5, 10)
+                    timeout=GOOGLE_API_TIMEOUT
                 )
                 response.raise_for_status()
                 data = response.json()

@@ -13,7 +13,7 @@ from django.utils import timezone
 import polyline
 
 from .cache_utils import EnhancedCacheKeyGenerator, RequestLockManager
-from .constants import GOOGLE_API_KEY, CACHE_TTL_ROUTE
+from .constants import GOOGLE_API_KEY, CACHE_TTL_ROUTE, GOOGLE_ROUTES_TIMEOUT
 from .geocoding import Location
 from .models import RouteCache
 
@@ -89,7 +89,7 @@ class RoutingService:
                 response = _http_session.get(
                     directions_url,
                     params=params,
-                    timeout=(5, 10)
+                    timeout=GOOGLE_ROUTES_TIMEOUT
                 )
 
                 logger.info(f"Google API Response Status: {response.status_code}")
