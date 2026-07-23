@@ -538,6 +538,7 @@ Routes travel time is not modeled. The detour penalty uses Euclidean (haversine)
 | GeocodeFailure table entries are never archived | Failed geocode records persist indefinitely | Manual cleanup or archival job for entries with `retry_count >= 10` |
 | No request authentication/authorization | API is publicly accessible if deployed | Intended for internal/service-to-service use; add API key middleware for external deployment |
 | No explicit PostgreSQL statement timeout | A hanging query blocks the worker indefinitely | Add `statement_timeout` via database options in production settings |
+| `ATOMIC_REQUESTS = True` holds DB transactions for entire request lifetime | Idle-in-transaction connections can exhaust connection pool under high concurrency | Remove `ATOMIC_REQUESTS` and wrap only the RouteRequest logging in an explicit transaction |
 
 ---
 
