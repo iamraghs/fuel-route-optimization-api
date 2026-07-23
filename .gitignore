@@ -162,6 +162,7 @@ PREPROCESSING_EXECUTION_LOG.txt.bak
 *.xlsx
 *.json.backup
 fuel_prices_*.csv
+cleaned_dataset_profile.html
 
 # ============================================================================
 # CERTIFICATE FILES
