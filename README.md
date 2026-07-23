@@ -470,7 +470,7 @@ Redis provides sub-millisecond reads for hot cache entries (optimization results
 
 ### Why PostGIS corridor queries over Python filtering
 
-An earlier implementation filtered stations in Python using haversine distance calculations. With 5,141 stations per request, this required O(n) distance computations per route. PostGIS ST_DWithin with a GIST index provides logarithmic spatial selectivity regardless of total station count. The Python fallback path exists only for database environments without PostGIS support.
+An earlier implementation filtered stations in Python using haversine distance calculations. With ~6,500 stations per request, this required O(n) distance computations per route. PostGIS ST_DWithin with a GIST index provides logarithmic spatial selectivity regardless of total station count. The Python fallback path exists only for database environments without PostGIS support.
 
 ### Why route geometry is separated from pricing
 
@@ -629,7 +629,7 @@ Station import runs through the preprocessing pipeline (`preprocessing.py`):
 - CSV loading with column validation
 - Address normalization and highway pattern expansion
 - USA-only filtering (50 states + DC)
-- Deduplication by OPIS ID (latest observation wins)
+- Deduplication by business key (OPIS ID + Rack ID + Retail Price)
 - Geocoding preparation
 
 Only stations with valid coordinates and active prices participate in corridor queries.
@@ -744,7 +744,7 @@ Server errors return HTTP 500 with an error description:
 
 ### Integration Tests
 
-186 integration tests covering 4 distance categories plus additional edge cases:
+180 integration tests covering 4 distance categories plus additional edge cases:
 
 | Category | Count | Distance Range | Description |
 |----------|-------|----------------|-------------|
@@ -752,9 +752,8 @@ Server errors return HTTP 500 with an error description:
 | MED | 50 | 500-1500 miles | 2-4 stops, standard optimization |
 | LONG | 50 | 1500-3000 miles | 6-10 stops, multi-state travel |
 | COAST | 30 | > 3000 miles | Coast-to-coast, 10-16 stops |
-| EDGE/INVALID | 6 | — | Coordinate input, same start/dest, unreachable, malformed input |
 
-**Pass rate: 186/186 (all tests passing, 0 failures)**
+**Pass rate: 180/180 (all tests passing, 0 failures)**
 
 Tests run against a live server via HTTP requests (curl).
 
@@ -887,7 +886,7 @@ fuel_routing/
   constants.py        — Vehicle parameters and cache TTLs
   models.py           — FuelStation, FuelPrice, PriceVersion, RouteCache, RouteRequest, GeocodeFailure
   serializers.py      — Request validation (input hardening), response serialization
-  preprocessing.py    — CSV preprocessing pipeline (10 stages, 5141 stations)
+  preprocessing.py    — CSV preprocessing pipeline (10 stages, ~6500 stations)
 config/
   settings.py         — Django settings, cache configuration, throttle rates
 test_all.py           — 186-case integration test suite
