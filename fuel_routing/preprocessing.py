@@ -423,7 +423,9 @@ class AddressQualityValidator(PreprocessingStep):
                 continue
             
             # Validate city name
-            if len(city_lower) < 2 or not city_lower.isalpha():
+            # Accept letters, spaces, hyphens, apostrophes, periods between them.
+            # Reject empty, numeric, punctuation-only, or malformed names.
+            if len(city_lower) < 2 or not re.match(r"^[a-z][a-z .'\-]*[a-z]$", city_lower):
                 rejected.append({
                     'row_num': record.get('row_num'),
                     'reason': f"Invalid city name: {record['city']}",
@@ -450,17 +452,26 @@ class Deduplicator(PreprocessingStep):
         self.duplicates_removed = 0
     
     def execute(self, records: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
-        """Deduplicate records by OPIS ID, keeping latest"""
-        deduped_dict: Dict[str, Dict] = {}
-        
-        # Group by OPIS ID, keep last (latest) observation
+        """Deduplicate records by business key (OPIS ID, Rack ID, Retail Price).
+
+        Only records identical across all three business-key fields are true
+        duplicates. Multiple prices for the same station (price snapshots) and
+        different rack IDs are legitimate business records and are preserved.
+        """
+        seen: Dict[Tuple, Dict] = {}
+        duplicates = 0
+
         for record in records:
-            opis_id = record['opis_id']
-            # Last record with this OPIS ID wins (order preserved from CSV)
-            deduped_dict[opis_id] = record
-        
-        valid = list(deduped_dict.values())
-        self.duplicates_removed = len(records) - len(valid)
+            # Business key: OPIS Truckstop ID + Rack ID + Retail Price
+            dedup_key = (record['opis_id'], record['rack_id'], str(record['retail_price']))
+
+            if dedup_key not in seen:
+                seen[dedup_key] = record
+            else:
+                duplicates += 1
+
+        valid = list(seen.values())
+        self.duplicates_removed = duplicates
         
         self.records_in = len(records)
         self.records_out = len(valid)
@@ -588,15 +599,16 @@ class FinalValidator(PreprocessingStep):
         valid = []
         rejected = []
         
-        seen_opis_ids = set()
-        
+        seen_business_keys = set()
+
         for record in records:
             reasons = []
-            
-            # Check no duplicate OPIS IDs
-            if record['opis_id'] in seen_opis_ids:
-                reasons.append("Duplicate OPIS ID (after dedup step)")
-            seen_opis_ids.add(record['opis_id'])
+
+            # Check no duplicate business keys (OPIS ID + Rack ID + Retail Price)
+            business_key = (record['opis_id'], record['rack_id'], str(record['retail_price']))
+            if business_key in seen_business_keys:
+                reasons.append("Duplicate business key (after dedup step)")
+            seen_business_keys.add(business_key)
             
             # Check no NULL critical fields
             if not record['opis_id']:
