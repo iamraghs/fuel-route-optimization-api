@@ -444,6 +444,18 @@ All five query paths use index scans. No sequential table scans were observed, i
 | Cache-hit response | ~50ms | Redis read + per-request field injection. |
 | Cold response (long route) | ~1–5s | Dominated by 2 geocoding API calls + 1 Directions API call + PostGIS query + fuel optimization. |
 
+### HTTP Protocol
+
+The API runs on **HTTP/1.1** via Gunicorn (WSGI). No HTTP/2 or HTTP/3 support is currently configured.
+
+| Protocol | Benefit | Relevance to this API |
+|----------|---------|-----------------------|
+| **HTTP/1.1** (current) | Simple, widely compatible, no encryption overhead | Suitable — response time dominated by backend Google API calls (1–5s), not network I/O |
+| **HTTP/2** | Multiplexing, header compression, server push | Negligible benefit — single-request-per-page pattern, no small resources to multiplex. Header compression saves ~200 bytes on a 2–10KB JSON response (< 1% improvement) |
+| **HTTP/3 (QUIC)** | Zero-RTT connection establishment, better lossy-network performance | No measurable benefit — server-side latency dominates, not connection setup |
+
+Network I/O accounts for **< 1%** of total request latency. Upgrading to HTTP/2 or HTTP/3 would not produce a perceptible improvement for this API.
+
 ---
 
 ## Design Decisions
