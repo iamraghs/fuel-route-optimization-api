@@ -623,14 +623,47 @@ Fuel prices are versioned through `PriceVersion`. A new version is published ato
 3. Optimization cache entries keyed by the old version ID become inaccessible (key mismatch), forcing recomputation with new prices
 4. Route geometry cache and corridor station cache are unaffected (they store coordinates, not prices)
 
-### Station Data
+### Station & Price Data
 
-Station import runs through the preprocessing pipeline (`preprocessing.py`):
-- CSV loading with column validation
-- Address normalization and highway pattern expansion
-- USA-only filtering (50 states + DC)
-- Deduplication by business key (OPIS ID + Rack ID + Retail Price)
-- Geocoding preparation
+**Preprocessing pipeline** (`preprocess_fuel_data`): cleans raw CSV → exports `fuel_prices_cleaned.csv`.
+
+**Loading new stations with prices from CSV** (`load_stations.py`):
+
+```bash
+# Add new stations + their prices from CSV. Existing stations/prices are NEVER touched.
+python load_stations.py
+
+# Preview only
+python load_stations.py --dry-run
+
+# Force-reload ALL prices from CSV (overwrites admin changes)
+python load_stations.py --refresh-prices
+```
+
+How it works:
+| Action | Stations | Prices |
+|--------|----------|--------|
+| First load | All 6,508 created from CSV | All 7,279 created from CSV |
+| Add 2 new stations to CSV → re-run | Only 2 new stations inserted | Only their 2 prices inserted |
+| Update price via admin panel | Unchanged | **Preserved** — not overwritten |
+| `--refresh-prices` | Unchanged | All deleted and re-inserted from CSV |
+
+**Geocoding:**
+
+```bash
+# Preview geocode queries without making API calls
+python geocode_stations.py --dry-run
+
+# Geocode first 100 stations (test batch)
+python geocode_stations.py --batch=100
+
+# Geocode ALL stations with (0,0) coordinates
+python geocode_stations.py
+```
+
+- Only stations with `latitude=0` are geocoded — already-geocoded stations are skipped
+- Google Geocoding API is called with the station's normalized address
+- Coordinates are saved to `FuelStation.latitude`, `longitude`, and `location_point`
 
 Only stations with valid coordinates and active prices participate in corridor queries.
 
