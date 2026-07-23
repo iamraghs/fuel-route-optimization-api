@@ -377,8 +377,8 @@ This replaces the previous behavior of returning `status: "success"` with negati
 
 | Failure | Mechanism | HTTP Status |
 |---------|-----------|-------------|
-| Google Geocoding timeout | `timeout=(5, 10)` -> `GeocodeFailure` record -> `ValueError` | 400 |
-| Google Directions timeout | `timeout=(5, 10)` -> propagates through coalesce lock | 500 |
+| Google Geocoding timeout | `GOOGLE_API_TIMEOUT=(10, 10)` -> `GeocodeFailure` record -> `ValueError` | 400 |
+| Google Directions timeout | `GOOGLE_ROUTES_TIMEOUT=(10, 15)` -> propagates through coalesce lock | 500 |
 | No active price version | `PriceVersion.objects.filter(is_active=True).first()` -> `ValueError` | 400 |
 | PostGIS exception | `try/except` -> fallback to bbox + Python haversine filter | 200 (degraded) |
 | Both corridor query paths fail | Per-route exception isolation -> empty station list | 200 (infeasible) |
@@ -429,7 +429,7 @@ All five query paths use index scans. No sequential table scans were observed, i
 - **Route optimization executor**: Per-request `ThreadPoolExecutor` with `max_workers=len(routes)` (max 2), created inside `with` block — automatically closed.
 - **ST_DWithin with GIST index**: O(log n) for spatial component. The `opis_id__in` pre-filter is constant (number of priced stations). Mixed-type `static/approx` index.
 - **Redis**: All cache keys have explicit TTLs (1h for optimization, 1h for corridor, 7d for geocode). No unbounded growth.
-- **RouteCache table**: Entries have `expires_at` field but no automated cleanup. At 10,000 unique routes/day (20,000 rows), annual storage is ~70GB for polyline data — manageable with PostgreSQL but warrants a monthly cleanup job at scale.
+- **RouteCache table**: Entries have `expires_at` field. Cleanup via `python manage.py cleanup_routecache` (dry-run default, `--apply` to delete). Recommended as monthly cron job.
 - **GeocodeFailure table**: Grows with each failed geocoding attempt. `retry_count ≤ 10` cap limits per-entry retries, but entries are never archived. At high failure rates, monitoring is needed.
 
 ### Verified Scaling Behavior
@@ -533,7 +533,6 @@ Routes travel time is not modeled. The detour penalty uses Euclidean (haversine)
 
 | Limitation | Impact | Mitigation |
 |------------|--------|------------|
-| RouteCache table has no automated cleanup | Expired rows accumulate indefinitely | Manual periodic cleanup: `DELETE FROM fuel_routing_routecache WHERE expires_at < NOW() - INTERVAL '7 days'` |
 | No Prometheus/StatsD metrics integration | Cannot monitor latency percentiles, cache hit ratios, or failure rates in production | Log-based monitoring via structured log aggregation |
 | Single-region deployment | All Google API calls, Redis, and PostgreSQL in one region | Regional failover requires multi-region Redis + PostgreSQL replication |
 | GeocodeFailure table entries are never archived | Failed geocode records persist indefinitely | Manual cleanup or archival job for entries with `retry_count >= 10` |
@@ -555,6 +554,7 @@ Routes travel time is not modeled. The detour penalty uses Euclidean (haversine)
 - **Rate limiting**: DRF `AnonRateThrottle` (1000 requests/hour) prevents abuse.
 - **Unreachable detection**: Routes with `available_fuel < required_fuel` return `status: "unreachable"` instead of a fake successful response with negative fuel remaining.
 - **Station change visibility**: Corridor cache keys include a station version suffix (`:sv{N}`). FuelStation signals auto-increment the version on insert/update/delete, making new stations immediately visible to optimization without explicit cache invalidation.
+- **RouteCache cleanup**: `python manage.py cleanup_routecache` removes expired and stale route cache entries. Dry-run by default; use `--apply` to delete. Prevents unbounded table growth.
 
 ### Not Implemented (Infrastructure-Level)
 
