@@ -251,7 +251,7 @@ Applied to: geocoding, route fetching, optimization computation.
 corridor_miles = min(50.0, max(10.0, 10.0 + route.distance_miles * 0.005))
 qs = FuelStation.objects.filter(
     is_active=True,
-    opis_id__in=opis_ids_with_prices,       # pre-filter to ~5000 priced stations
+    opis_id__in=opis_ids_with_prices,       # pre-filter to ~7300 priced stations
     location_point__dwithin=(route_line, D(mi=corridor_miles)),
 )
 ```
@@ -399,7 +399,7 @@ Based on 180 test route observations:
 | Cache hit latency | <50ms | Redis get + per-request field injection |
 | Cold short route (<500mi) | ~800-1500ms | Geocoding + Directions API + estimate |
 | Cold long route (~1000mi) | ~1000-2500ms | Geocoding + Directions + PostGIS + optimizer |
-| Cold coast-to-coast (~3300mi) | ~1500-5000ms | Full pipeline, 10-16 stops |
+| Cold coast-to-coast (~3300mi) | ~1500–6500ms | Full pipeline, 10-16 stops |
 | Google API calls per request | 3 (cache miss) / 0 (cache hit) | 2 geocoding + 1 directions |
 | DB queries per cold request | 3-5 | PriceVersion, RouteCache, FuelPrice avg, station query |
 
@@ -478,9 +478,9 @@ Route geometry (Google polyline, decoded coordinates) does not change when fuel 
 
 ### Why detour is limited to 5 miles with round-trip costing
 
-The detour system uses a two-stage filter. First, stations with a detour exceeding 5 miles (Euclidean distance from the route polyline) are excluded from consideration entirely (`optimizer.py:331-332`). This is a hard eligibility threshold: stations more than 5 miles off the route are never worth the extra driving.
+The detour system uses a two-stage filter. First, stations with a detour exceeding 5 miles (Euclidean distance from the route polyline) are excluded from consideration entirely (`optimizer.py`). This is a hard eligibility threshold: stations more than 5 miles off the route are never worth the extra driving.
 
-Second, for eligible stations, the effective travel distance includes a 2× detour penalty (`optimizer.py:334`):
+Second, for eligible stations, the effective travel distance includes a 2× detour penalty (`optimizer.py`):
 
 ```
 effective_distance = distance_along_route + 2.0 * detour_miles
@@ -905,8 +905,11 @@ Vehicle and optimization parameters in `constants.py` (all configurable via Djan
 
 ```
 fuel_routing/
+  __init__.py         — Package initialization
   api.py              — REST API endpoint (POST /route/fuel-optimization/)
   views.py            — Health check endpoint (GET /route/health/)
+  admin.py            — Django admin configuration for all models
+  apps.py             — Django AppConfig with signal wiring
   engine.py           — Request orchestrator, response building, unreachable detection
   optimizer.py        — Greedy + Lookahead fuel optimizer, cross-track snapping
   cache_service.py    — Optimization result cache (Redis, price-version keyed)
@@ -921,7 +924,9 @@ fuel_routing/
   serializers.py      — Request validation (input hardening), response serialization
   preprocessing.py    — CSV preprocessing pipeline (10 stages, ~6500 stations)
 config/
+  __init__.py         — Package initialization
   settings.py         — Django settings, cache configuration, throttle rates
-test_all.py           — 186-case integration test suite
+  urls.py             — URL routing and endpoint mapping
+test_all.py           — 180-case integration test suite
 ```
 
