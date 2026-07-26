@@ -820,8 +820,8 @@ Generated from actual API execution against the live server (not mocked):
 
 | Artifact | Content | Purpose |
 |----------|---------|---------|
-| `all_test_requests.json` | Input payloads for all 186 tests | Reproducing test scenarios |
-| `all_test_responses.json` | Full API responses for all 186 tests | Response structure verification |
+| `all_test_requests.json` | Input payloads for all 180 tests | Reproducing test scenarios |
+| `all_test_responses.json` | Full API responses for all 180 tests | Response structure verification |
 | `validation_results.json` | Per-test validation outcomes | Invariant compliance auditing |
 | `failed_validations.json` | Tests with validation failures (empty = all pass) | Regression tracking |
 | `summary_report.md` | Aggregate results and category breakdown | Quick review reference |
@@ -829,9 +829,6 @@ Generated from actual API execution against the live server (not mocked):
 ```bash
 # Start server, then run tests
 python test_all.py
-
-# Generate validation artifacts
-# python test_artifacts/generate.py
 ```
 
 ---
@@ -851,7 +848,7 @@ python manage.py migrate
 # Preprocess station CSV (outputs fuel_prices_cleaned.csv)
 # Note: This only cleans the CSV — it does NOT insert stations into the database.
 # The cleaned CSV contains address data and a geocode_query field, but no coordinates.
-# Stations must be loaded separately (see "Loading Station Data" below).
+# Stations must be loaded separately (see "Quick Start" below).
 python manage.py preprocess_fuel_data
 
 # Environment
@@ -873,18 +870,22 @@ gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4
 
 ---
 
-### Loading Station Data
+### Quick Start
 
-The preprocessing pipeline (`preprocess_fuel_data`) cleans the raw CSV and outputs `fuel_prices_cleaned.csv`, but it does **not** insert stations into the database. The FuelStation and FuelPrice tables must be populated separately.
+```bash
+# 1. Preprocess raw CSV → exports fuel_prices_cleaned.csv
+python manage.py preprocess_fuel_data
 
-Station data can be loaded by:
+# 2. Load stations and prices into database
+python load_stations.py
 
-1. **Batch geocoding:** Read `fuel_prices_cleaned.csv`, call the Google Geocoding API for each `geocode_query`, create FuelStation records with the returned coordinates, create FuelPrice records with the `retail_price`, and create an active PriceVersion.
-2. **Direct insert:** If coordinates are already known, insert FuelStation and FuelPrice records directly.
+# 3. Geocode stations (resolves (0,0) to real coordinates)
+python geocode_stations.py
 
-**Duplicate handling:** FuelStation has a `unique` constraint on `opis_id`. If the loaded CSV contains an `opis_id` that already exists in the database, the insert will fail with a duplicate key error. The solution is to either:
-- Truncate existing data before reloading, or
-- Use `update_or_create` to update prices for existing stations while skipping coordinate updates (coordinates rarely change).
+# 4. Start server and test
+python manage.py runserver &
+python test_all.py
+```
 
 ## Configuration
 
