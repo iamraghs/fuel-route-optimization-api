@@ -159,7 +159,7 @@ The optimizer (`FuelOptimizer.calculate_fuel_stops`) processes stations in forwa
 
 2. **Evaluate each candidate in distance order** (first acceptable match wins):
 
-   - **to_destination**: Destination reachable after filling up. Buy only what is needed for the remaining distance plus reserve. Before committing, checks if a cheaper station is reachable directly from current position — if so, skips this station.
+   - **to_destination**: Destination reachable after filling up. Buy only what is needed for the remaining distance plus reserve. Before committing, checks if a cheaper station is reachable directly from current position — if so, skips it. Also scans all stations within full-tank range for cheaper options via partial fill.
    
    - **partial**: Cheaper station exists ahead within full-tank range but is not directly reachable. Buy just enough fuel to reach that cheaper station (including reserve and a 20-mile safety margin).
    
