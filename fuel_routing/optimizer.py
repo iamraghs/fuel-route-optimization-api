@@ -396,6 +396,51 @@ class FuelOptimizer:
                         )
                         continue
 
+                    # NEW: scan _station_index for cheaper stations reachable via partial fill
+                    # (same logic as CASE 2 lookahead — full_tank_effective_range horizon)
+                    _c1_cheaper = None
+                    for oid, info in _station_index.items():
+                        if oid in visited_stations:
+                            continue
+                        if info['distance'] <= station_distance:
+                            continue
+                        if info['distance'] > station_distance + full_tank_effective_range:
+                            continue
+                        # Apply same detour filters as candidate construction
+                        _c1_det = station_route_data.get(oid, {}).get('detour_miles', 0.0)
+                        _c1_along = info['distance'] - station_distance
+                        if _c1_det > MAX_DETOUR_MILES or _c1_det > _c1_along:
+                            continue
+                        if info['price'] < price:
+                            if _c1_cheaper is None or info['price'] < _c1_cheaper['price']:
+                                _c1_cheaper = {
+                                    'distance_from_start': info['distance'],
+                                    'price': info['price'],
+                                    'station': {'name': info['name']},
+                                    'opis_id': oid,
+                                }
+
+                    if _c1_cheaper:
+                        # If reachable directly from current position, skip this candidate
+                        if _c1_cheaper['distance_from_start'] - current_position <= current_effective_range:
+                            continue
+                        # Verify genuine partial fill (target reachable without filling tank)
+                        _c1_dt = _c1_cheaper['distance_from_start'] - station_distance
+                        _c1_det = station_route_data.get(_c1_cheaper['opis_id'], {}).get('detour_miles', 0.0)
+                        _c1_eff = _c1_dt + 2.0 * _c1_det
+                        _c1_fn = (_c1_eff + 20.0 + VEHICLE_RESERVE_MILES) / VEHICLE_MPG
+                        if _c1_fn < float(VEHICLE_TANK):
+                            selected = candidate
+                            selected_strategy = 'partial'
+                            target_cheaper = _c1_cheaper
+                            logger.debug(
+                                f"Partial fill at {candidate['station']['name']} (@{price:.3f}) - "
+                                f"targeting cheaper {_c1_cheaper['station']['name']} "
+                                f"(@{_c1_cheaper['price']:.3f}) via CASE 1 lookahead"
+                            )
+                            break
+                        # else: target requires near-full tank → fall through to to_destination
+
                     selected = candidate
                     selected_strategy = 'to_destination'
                     logger.debug(
