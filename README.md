@@ -575,7 +575,6 @@ Routes travel time is not modeled. The detour penalty uses Euclidean (haversine)
 | Single-region deployment | All Google API calls, Redis, and PostgreSQL in one region | Regional failover requires multi-region Redis + PostgreSQL replication |
 | GeocodeFailure table entries are never archived | Failed geocode records persist indefinitely | Manual cleanup or archival job for entries with `retry_count >= 10` |
 | No request authentication/authorization | API is publicly accessible if deployed | Intended for internal/service-to-service use; add API key middleware for external deployment |
-| No explicit PostgreSQL statement timeout | A hanging query blocks the worker indefinitely | Add `statement_timeout` via database options in production settings |
 | Threaded workers not configured (Gunicorn process-only model) | Under high concurrency, processes block on IO (Google API calls) while CPU sits idle | Deploy with `--threads N` to handle IO waits concurrently within each process |
 
 ---
@@ -594,6 +593,7 @@ Routes travel time is not modeled. The detour penalty uses Euclidean (haversine)
 - **Unreachable detection**: Routes with `available_fuel < required_fuel` return `status: "unreachable"` instead of a fake successful response with negative fuel remaining.
 - **Station change visibility**: Corridor cache keys include a station version suffix (`:sv{N}`). FuelStation signals auto-increment the version on insert/update/delete, making new stations immediately visible to optimization without explicit cache invalidation.
 - **RouteCache cleanup**: `python manage.py cleanup_routecache` removes expired and stale route cache entries. Dry-run by default; use `--apply` to delete. Prevents unbounded table growth.
+- **PostgreSQL statement timeout**: Database connections have a 30-second `statement_timeout` guardrail, preventing malformed spatial queries from hanging connections under load.
 
 ### Not Implemented (Infrastructure-Level)
 
