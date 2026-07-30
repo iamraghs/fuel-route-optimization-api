@@ -432,6 +432,32 @@ All five query paths use index scans. No sequential table scans were observed, i
 - **RouteCache table**: Entries have `expires_at` field. Cleanup via `python manage.py cleanup_routecache` (dry-run default, `--apply` to delete). Recommended as monthly cron job.
 - **GeocodeFailure table**: Grows with each failed geocoding attempt. `retry_count ≤ 10` cap limits per-entry retries, but entries are never archived. At high failure rates, monitoring is needed.
 
+### Concurrency Model
+
+The API runs on **WSGI** (Gunicorn) with synchronous workers. Each request is ~98% IO-bound (waiting on Google Geocoding + Directions API) and ~2% CPU-bound (PostGIS, optimization).
+
+```
+Request timeline:  [Geocoding API]→[Directions API]→[PostGIS]→[Optimizer]→[Serialize]
+CPU active:         ░░░░░░░░░░░░░░    ░░░░░░░░░░░░░░    ██░░░░    ██░░░      ██
+                    ╰──── IO wait ────╯╰─── IO wait ───╯╰─ CPU ╯╰─ CPU ╯╰─ CPU ╯
+```
+
+Without threading, a process blocks entirely during IO waits — CPU sits idle while the worker waits for Google's API response. With default `--workers 4`, only 4 concurrent requests are handled regardless of available CPU.
+
+**Production deployment:**
+
+```bash
+# Process-only model (current default — limited concurrency)
+gunicorn config.wsgi:application --workers 4
+
+# Threaded model (recommended — handles IO waits efficiently)
+gunicorn config.wsgi:application --workers 4 --threads 8
+```
+
+With `--threads 8`, each of the 4 processes runs 8 threads (32 concurrent capacity). Python releases the GIL during IO waits, so while one thread waits for Google's API, another thread can process a different request on the same CPU. This matches the IO-bound profile of the API without requiring async/await refactoring.
+
+**Database connections** use persistent pooling (`CONN_MAX_AGE=600`) and `ATOMIC_REQUESTS` is disabled — transactions are not held open during IO waits, preventing connection pool exhaustion under high concurrency.
+
 ### Verified Scaling Behavior
 
 | Parameter | Bounds | Evidence |
@@ -550,7 +576,7 @@ Routes travel time is not modeled. The detour penalty uses Euclidean (haversine)
 | GeocodeFailure table entries are never archived | Failed geocode records persist indefinitely | Manual cleanup or archival job for entries with `retry_count >= 10` |
 | No request authentication/authorization | API is publicly accessible if deployed | Intended for internal/service-to-service use; add API key middleware for external deployment |
 | No explicit PostgreSQL statement timeout | A hanging query blocks the worker indefinitely | Add `statement_timeout` via database options in production settings |
-| `ATOMIC_REQUESTS = True` holds DB transactions for entire request lifetime | Idle-in-transaction connections can exhaust connection pool under high concurrency | Remove `ATOMIC_REQUESTS` and wrap only the RouteRequest logging in an explicit transaction |
+| Threaded workers not configured (Gunicorn process-only model) | Under high concurrency, processes block on IO (Google API calls) while CPU sits idle | Deploy with `--threads N` to handle IO waits concurrently within each process |
 
 ---
 

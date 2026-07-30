@@ -71,7 +71,6 @@ DATABASES = {
         'HOST': config('DB_HOST', default='localhost'),
         'PORT': config('DB_PORT', default='5432'),
         'CONN_MAX_AGE': 600,
-        'ATOMIC_REQUESTS': True,
     }
 }
 
