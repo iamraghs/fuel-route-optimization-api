@@ -286,6 +286,9 @@ class FuelOptimizer:
 
         current_fuel = VEHICLE_TANK
         current_position = 0.0
+        # Detour of the station currently at (0.0 = on the highway at start).
+        # Return-to-route fuel is charged on the NEXT leg via this variable.
+        current_detour = 0.0
 
         total_fuel_purchased = 0.0
 
@@ -304,7 +307,7 @@ class FuelOptimizer:
 
         while current_position < route.distance_miles and iteration < max_iterations:
             iteration += 1
-            remaining_distance = route.distance_miles - current_position
+            remaining_distance = route.distance_miles - current_position + current_detour
             remaining_range = current_fuel * VEHICLE_MPG
 
             if remaining_distance <= remaining_range:
@@ -336,7 +339,7 @@ class FuelOptimizer:
                 if detour_miles > MAX_DETOUR_MILES:
                     continue
 
-                effective_distance = distance_along_route + 2.0 * detour_miles
+                effective_distance = current_detour + distance_along_route + detour_miles
 
                 fuel_needed_to_reach = effective_distance / VEHICLE_MPG
 
@@ -372,7 +375,8 @@ class FuelOptimizer:
             target_cheaper = None
 
             # Effective range from current position (changes with each stop)
-            current_effective_range = current_fuel * VEHICLE_MPG - VEHICLE_RESERVE_MILES
+            # Subtracts current_detour: fuel at the station must first return to the highway
+            current_effective_range = current_fuel * VEHICLE_MPG - current_detour - VEHICLE_RESERVE_MILES
 
             for candidate in candidates:
                 station_distance = candidate['distance_from_start']
@@ -427,7 +431,8 @@ class FuelOptimizer:
                         # Verify genuine partial fill (target reachable without filling tank)
                         _c1_dt = _c1_cheaper['distance_from_start'] - station_distance
                         _c1_det = station_route_data.get(_c1_cheaper['opis_id'], {}).get('detour_miles', 0.0)
-                        _c1_eff = _c1_dt + 2.0 * _c1_det
+                        # Return-to-route from candidate + highway + detour to target
+                        _c1_eff = candidate['detour_miles'] + _c1_dt + _c1_det
                         _c1_fn = (_c1_eff + 20.0 + VEHICLE_RESERVE_MILES) / VEHICLE_MPG
                         if _c1_fn < float(VEHICLE_TANK):
                             selected = candidate
@@ -517,13 +522,18 @@ class FuelOptimizer:
 
             if selected_strategy == 'to_destination':
                 dest_distance = route.distance_miles - selected['distance_from_start']
-                fuel_needed = (dest_distance + VEHICLE_RESERVE_MILES) / VEHICLE_MPG
+                # Include return-to-route detour from this last stop
+                fuel_needed = (selected['detour_miles'] + dest_distance + VEHICLE_RESERVE_MILES) / VEHICLE_MPG
                 fuel_to_buy = max(0.0, min(
                     fuel_needed - fuel_at_arrival,
                     float(VEHICLE_TANK) - fuel_at_arrival
                 ))
             elif selected_strategy == 'partial' and target_cheaper:
-                dist_to_cheaper = target_cheaper['distance_from_start'] - selected['distance_from_start']
+                # Include return-to-route from this stop + detour to target
+                _tgt_det = station_route_data.get(target_cheaper['opis_id'], {}).get('detour_miles', 0.0)
+                dist_to_cheaper = (selected['detour_miles'] +
+                                   target_cheaper['distance_from_start'] - selected['distance_from_start'] +
+                                   _tgt_det)
                 fuel_needed_to_cheaper = (dist_to_cheaper + 20.0 + VEHICLE_RESERVE_MILES) / VEHICLE_MPG
                 fuel_to_buy = max(0.0, min(
                     fuel_needed_to_cheaper - fuel_at_arrival,
@@ -603,6 +613,7 @@ class FuelOptimizer:
             current_fuel = fuel_after_refuel
             total_fuel_purchased += fuel_to_buy
             current_position = selected['distance_from_start']
+            current_detour = selected['detour_miles']
 
             if current_position <= old_position:
                 logger.error(f"Route progression error: {old_position:.1f} -> {current_position:.1f}")

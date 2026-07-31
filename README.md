@@ -506,13 +506,13 @@ Route geometry (Google polyline, decoded coordinates) does not change when fuel 
 
 The detour system uses a two-stage filter. First, stations with a detour exceeding 5 miles (Euclidean distance from the route polyline) are excluded from consideration entirely (`optimizer.py`). This is a hard eligibility threshold: stations more than 5 miles off the route are never worth the extra driving.
 
-Second, for eligible stations, the effective travel distance includes a 2× detour penalty (`optimizer.py`):
+Second, for eligible stations, each leg charges exactly the fuel physically consumed — return from the current station, highway travel, and detour to the next station (`optimizer.py`):
 
 ```
-effective_distance = distance_along_route + 2.0 * detour_miles
+effective_distance = current_detour + distance_along_route + detour_miles
 ```
 
-This models the round-trip cost of leaving and returning to the highway. The 5-mile one-way limit was chosen based on typical highway exit spacing and fuel station placement along US interstates: stations beyond 5 miles from the route are rarely accessible via a short side trip.
+This models the round trip per stop: driving off the highway to a station and driving back before continuing. The total trip fuel equals `route + 2 × Σ(detour)` — mathematically identical to a naive `2×detour` per-leg penalty, but allocated to the correct leg so intermediate fuel states are exact. The 5-mile one-way limit was chosen based on typical highway exit spacing and fuel station placement along US interstates: stations beyond 5 miles from the route are rarely accessible via a short side trip.
 
 Routes travel time is not modeled. The detour penalty uses Euclidean (haversine) distance rather than road-network distance, which is a simplification that underestimates actual driving distance but keeps computation within the optimizer loop.
 
