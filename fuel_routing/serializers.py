@@ -126,6 +126,9 @@ class TripSummarySerializer(serializers.Serializer):
     fuel_purchased_at_stops = serializers.SerializerMethodField()
     total_fuel_available = serializers.SerializerMethodField()
     fuel_remaining_at_destination = serializers.SerializerMethodField()
+
+    # ✅ Vehicle profile (configurable via env)
+    vehicle_profile = serializers.DictField(required=False)
     
     def get_total_distance_miles(self, obj):
         """Round to 1 decimal place."""
@@ -174,19 +177,79 @@ class TripSummarySerializer(serializers.Serializer):
 # REQUEST/RESPONSE SERIALIZERS
 # ============================================================================
 
+import re
+
+# Patterns that indicate garbage input — rejected before any geocoding call.
+_INVALID_ADDRESS_PATTERNS = [
+    re.compile(r'^[^a-zA-Z]+$'),             # no letters at all: "!!!!!", "###", "???"
+    re.compile(r'^null$', re.IGNORECASE),    # "null", "NULL"
+    re.compile(r'^undefined$', re.IGNORECASE),
+    re.compile(r'^n/?a$', re.IGNORECASE),    # "N/A", "na"
+    re.compile(r'<[^>]*>'),                  # HTML/JS: <script>, <img>
+    re.compile(r'[;]\s*(DROP|DELETE|INSERT|UPDATE|SELECT|UNION)', re.IGNORECASE),  # SQL injection
+    re.compile(r'\.\.[/\\\\]'),              # path traversal
+]
+
+# Valid US ZIP codes are exactly 5 digits ("33101"). Shorter numeric strings
+# ("566", "12") and invalid lengths are garbage.
+_VALID_ZIP_RE = re.compile(r'^\d{5}$')
+
+
+def _is_valid_address_string(value: str) -> bool:
+    """Reject garbage address strings before calling the geocoder."""
+    stripped = value.strip()
+    if not stripped:
+        return False
+
+    # Pure numbers: only valid as 5-digit US ZIP codes ("33101").
+    # "566", "00000", "12345x" are rejected.
+    if stripped.isdigit():
+        return bool(_VALID_ZIP_RE.match(stripped))
+
+    # Structural garbage patterns (HTML, SQL, path traversal, symbols)
+    if any(p.search(stripped) for p in _INVALID_ADDRESS_PATTERNS):
+        return False
+
+    # Too short to be a real place ("a", "x", "aa")
+    if len(stripped) < 3:
+        return False
+
+    # All same character ("aaa", "zzzz", "1111")
+    if len(set(stripped)) == 1:
+        return False
+
+    # No vowels at all → not a pronounceable place name ("ghjkl", "xyzzy")
+    if not any(c in 'aeiouyAEIOUY' for c in stripped):
+        return False
+
+    # Garbage letter runs: no vowels, only consonants in long strings
+    # (covers random keyboard mashing like "uhjdhuegyd" if it lacks vowels;
+    #  note: some real places have few vowels, so this is deliberately
+    #  conservative — the geocoder confidence gate handles the rest)
+    vowel_count = sum(1 for c in stripped if c in 'aeiouyAEIOUY')
+    if vowel_count == 0:
+        return False
+
+    return True
+
+
 class FuelOptimizationRequestSerializer(serializers.Serializer):
     """Fuel optimization API request."""
     start = serializers.JSONField(help_text="Start location: address or {'lat': x, 'lng': y}")
     finish = serializers.JSONField(help_text="End location: address or {'lat': x, 'lng': y}")
-    
-    def validate_start(self, value):
-        """Validate start location format."""
+
+    def _validate_location(self, value, field_name):
+        """Common validation for start and finish locations."""
         if isinstance(value, str):
-            if 1 <= len(value) <= 1024:
-                return value
-            raise serializers.ValidationError(
-                "Address must be between 1 and 1024 characters"
-            )
+            if not (1 <= len(value) <= 1024):
+                raise serializers.ValidationError(
+                    f"{field_name} must be between 1 and 1024 characters"
+                )
+            if not _is_valid_address_string(value):
+                raise serializers.ValidationError(
+                    f"{field_name} could not be resolved to a valid location."
+                )
+            return value
         if isinstance(value, dict):
             lat = value.get('lat')
             if lat is None:
@@ -197,41 +260,24 @@ class FuelOptimizationRequestSerializer(serializers.Serializer):
             if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
                 if not (-90.0 <= lat <= 90.0):
                     raise serializers.ValidationError(
-                        "Latitude must be between -90 and 90."
+                        f"{field_name} latitude must be between -90 and 90."
                     )
                 if not (-180.0 <= lng <= 180.0):
                     raise serializers.ValidationError(
-                        "Longitude must be between -180 and 180."
+                        f"{field_name} longitude must be between -180 and 180."
                     )
                 return value
-        raise serializers.ValidationError("Must be address string or {'lat': x, 'lng': y}")
+        raise serializers.ValidationError(
+            f"{field_name} must be address string or {{'lat': x, 'lng': y}}"
+        )
+
+    def validate_start(self, value):
+        """Validate start location format."""
+        return self._validate_location(value, 'start')
 
     def validate_finish(self, value):
         """Validate finish location format."""
-        if isinstance(value, str):
-            if 1 <= len(value) <= 1024:
-                return value
-            raise serializers.ValidationError(
-                "Address must be between 1 and 1024 characters"
-            )
-        if isinstance(value, dict):
-            lat = value.get('lat')
-            if lat is None:
-                lat = value.get('latitude')
-            lng = value.get('lng')
-            if lng is None:
-                lng = value.get('longitude')
-            if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
-                if not (-90.0 <= lat <= 90.0):
-                    raise serializers.ValidationError(
-                        "Latitude must be between -90 and 90."
-                    )
-                if not (-180.0 <= lng <= 180.0):
-                    raise serializers.ValidationError(
-                        "Longitude must be between -180 and 180."
-                    )
-                return value
-        raise serializers.ValidationError("Must be address string or {'lat': x, 'lng': y}")
+        return self._validate_location(value, 'finish')
 
 
 class FuelOptimizationResponseSerializer(serializers.Serializer):

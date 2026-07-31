@@ -103,6 +103,13 @@ class RoutingService:
                 if data.get('status') != 'OK':
                     error_msg = f"Google API status: {data.get('status')} - {data.get('error_message', 'Unknown error')}"
                     logger.error(f"Error: {error_msg}")
+                    # ZERO_RESULTS = no drivable route exists (e.g. island,
+                    # national park, or same-location edge). Return a clean
+                    # client error (400), not a 500.
+                    if data.get('status') == 'ZERO_RESULTS':
+                        raise ValueError(
+                            "No drivable route exists between the given locations."
+                        )
                     raise Exception(error_msg)
 
                 routes_list = []

@@ -31,7 +31,24 @@ def optimize_fuel_route(request):
     # Validate request
     serializer = FuelOptimizationRequestSerializer(data=request.data)
     if not serializer.is_valid():
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        # Structured validation error: identify which field failed
+        errors = serializer.errors
+        error_code = "INVALID_REQUEST"
+        message = "Invalid request"
+        if 'finish' in errors:
+            error_code = "INVALID_DESTINATION"
+            message = errors['finish'][0] if isinstance(errors['finish'], list) else str(errors['finish'])
+        elif 'start' in errors:
+            error_code = "INVALID_ORIGIN"
+            message = errors['start'][0] if isinstance(errors['start'], list) else str(errors['start'])
+        return Response(
+            {
+                "status": "error",
+                "error_code": error_code,
+                "message": message,
+            },
+            status=status.HTTP_400_BAD_REQUEST
+        )
     
     start_input = serializer.validated_data['start']
     end_input = serializer.validated_data['finish']
@@ -72,8 +89,17 @@ def optimize_fuel_route(request):
         
     except ValueError as e:
         logger.error(f"Validation error: {e}")
+        # Geocoding failures get a structured error code
+        msg = str(e)
+        error_code = "INVALID_REQUEST"
+        if "could not be resolved" in msg.lower() or "geocode" in msg.lower():
+            error_code = "INVALID_DESTINATION" if "destination" in msg.lower() or "end" in msg.lower() else "INVALID_ORIGIN"
         return Response(
-            {'error': str(e)},
+            {
+                "status": "error",
+                "error_code": error_code,
+                "message": msg,
+            },
             status=status.HTTP_400_BAD_REQUEST
         )
     except Exception as e:

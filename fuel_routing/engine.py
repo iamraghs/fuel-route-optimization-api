@@ -18,7 +18,7 @@ from .cache_utils import (
 from .cache_service import get_cached_optimization, get_or_compute_optimization, set_cached_optimization
 from .constants import (
     GOOGLE_API_KEY, VEHICLE_MAX_RANGE, VEHICLE_MPG, VEHICLE_TANK,
-    MIN_DESTINATION_RESERVE_GALLONS,
+    VEHICLE_RESERVE_MILES, MIN_DESTINATION_RESERVE_GALLONS,
 )
 from .geocoding import GeocodingService, Location
 from .models import FuelPrice, FuelStation, PriceVersion
@@ -139,13 +139,51 @@ class FuelRouteOptimizationEngine:
         logger.info(f"[{request_id}] Starting optimization: {start_input} -> {end_input}")
 
         try:
-            # Get active price version (cached in-process to avoid repeated DB queries)
-            pv = _get_active_price_version()
+            # Validate API key FIRST (before any external call)
+            if not GOOGLE_API_KEY or GOOGLE_API_KEY == 'your_google_maps_api_key_here':
+                raise ValueError(
+                    "Google Maps API key not configured. "
+                    "Set GOOGLE_MAPS_API_KEY in your environment or .env file."
+                )
 
-            # Attempt lightweight cache check first (fast path)
-            cached_result = get_cached_optimization(start_input, end_input, price_version=pv)
+            # Parse location display info
+            start_city, start_state, start_formatted = \
+                FuelRouteOptimizationEngine._parse_location_for_display(start_input)
+            end_city, end_state, end_formatted = \
+                FuelRouteOptimizationEngine._parse_location_for_display(end_input)
+
+            # ── STEP 1: RESOLVE LOCATIONS (must succeed before any caching/routing) ──
+            # Geocoding includes a confidence gate: country-only fallbacks for
+            # garbage input are rejected, so unresolved locations NEVER reach
+            # the cache or route generation.
+            start_future = _geocode_executor.submit(
+                FuelRouteOptimizationEngine._resolve_location, start_input, request_id
+            )
+            end_future = _geocode_executor.submit(
+                FuelRouteOptimizationEngine._resolve_location, end_input, request_id
+            )
+            start_loc = start_future.result(timeout=30)
+            end_loc = end_future.result(timeout=30)
+
+            if not start_loc:
+                raise ValueError(
+                    "Origin could not be resolved to a valid location."
+                )
+            if not end_loc:
+                raise ValueError(
+                    "Destination could not be resolved to a valid location."
+                )
+
+            # ── STEP 2: CHECK CACHE KEYED BY RESOLVED COORDINATES ──
+            # Cache key uses normalized coordinates, NOT raw input. This ensures
+            # failed geocodes can never reuse a previous route's cached result,
+            # and semantically identical places share one cache entry.
+            coord_start = {'lat': start_loc.latitude, 'lng': start_loc.longitude}
+            coord_end = {'lat': end_loc.latitude, 'lng': end_loc.longitude}
+
+            pv = _get_active_price_version()
+            cached_result = get_cached_optimization(coord_start, coord_end, price_version=pv)
             if cached_result is not None:
-                # Deep copy prevents in-place mutation of cached object
                 cached_result = copy.deepcopy(cached_result)
                 elapsed_ms = int((time.time() - start_time) * 1000)
                 cached_result['optimization_time_ms'] = elapsed_ms
@@ -163,32 +201,6 @@ class FuelRouteOptimizationEngine:
                     )
                 return cached_result
 
-            # Validate API key
-            if not GOOGLE_API_KEY or GOOGLE_API_KEY == 'your_google_maps_api_key_here':
-                raise ValueError(
-                    "Google Maps API key not configured. "
-                    "Set GOOGLE_MAPS_API_KEY in your environment or .env file."
-                )
-
-            # Parse location display info
-            start_city, start_state, start_formatted = \
-                FuelRouteOptimizationEngine._parse_location_for_display(start_input)
-            end_city, end_state, end_formatted = \
-                FuelRouteOptimizationEngine._parse_location_for_display(end_input)
-
-            # Resolve locations in parallel using module-level executor
-            start_future = _geocode_executor.submit(
-                FuelRouteOptimizationEngine._resolve_location, start_input, request_id
-            )
-            end_future = _geocode_executor.submit(
-                FuelRouteOptimizationEngine._resolve_location, end_input, request_id
-            )
-            start_loc = start_future.result(timeout=30)
-            end_loc = end_future.result(timeout=30)
-
-            if not start_loc or not end_loc:
-                raise ValueError("Could not geocode start or end location")
-
             # For coordinate inputs, reverse-geocode to get human-readable address
             if isinstance(start_input, dict):
                 start_city, start_state, start_formatted = GeocodingService.reverse_geocode(
@@ -199,12 +211,26 @@ class FuelRouteOptimizationEngine:
                     end_loc.latitude, end_loc.longitude, request_id
                 )
 
-            # Get routes from Google API
+            # ── STEP 3: GET ROUTES ──
             routes = RoutingService.get_routes(start_loc, end_loc, max_alternatives=2, request_id=request_id)
             if not routes:
                 raise ValueError("No routes found from Google API")
 
-            # Define optimization compute (used by coalesced cache below)
+            # Route realism validation: no fabricated or zero-length routes.
+            # Zero distance is only valid when origin == destination.
+            same_location = (
+                abs(start_loc.latitude - end_loc.latitude) < 1e-6
+                and abs(start_loc.longitude - end_loc.longitude) < 1e-6
+            )
+            for r in routes:
+                if r.distance_miles < 0 or r.duration_seconds < 0 or not r.polyline_encoded:
+                    logger.error(f"[{request_id}] Route {r.route_id} has invalid geometry")
+                    raise ValueError("Route could not be validated")
+                if r.distance_miles == 0 and not same_location:
+                    logger.error(f"[{request_id}] Route {r.route_id} fabricated zero distance")
+                    raise ValueError("Route could not be validated")
+
+            # ── STEP 4: OPTIMIZE (coalesced by coordinate key) ──
             def _compute_optimization_internal():
                 """Run optimization and return result (called at most once under lock)."""
                 primary_route = routes[0]
@@ -223,11 +249,8 @@ class FuelRouteOptimizationEngine:
                     request_id, start_time, pv
                 )
 
-            # Coalesced optimization with stampede protection.
-            # The compute_fn runs at most once per cache key. Concurrent requests
-            # for the same inputs wait for and reuse the cached result.
             result = get_or_compute_optimization(
-                start_input, end_input, pv,
+                coord_start, coord_end, pv,
                 compute_fn=_compute_optimization_internal,
             )
             if result is None:
@@ -308,6 +331,12 @@ class FuelRouteOptimizationEngine:
                 'average_price_per_gallon': round(avg_price_per_gal, 3),
                 'total_fuel_stops': 0,
                 'starting_fuel_gallons': VEHICLE_TANK,
+                'vehicle_profile': {
+                    'mpg': VEHICLE_MPG,
+                    'tank_capacity_gallons': VEHICLE_TANK,
+                    'max_range_miles': VEHICLE_MAX_RANGE,
+                    'reserve_miles': VEHICLE_RESERVE_MILES,
+                },
                 'fuel_purchased_at_stops': 0.0,
                 'total_fuel_available': round(VEHICLE_TANK, 1),
                 'fuel_remaining_at_destination': round(VEHICLE_TANK - estimated_fuel, 1),
@@ -840,6 +869,12 @@ class FuelRouteOptimizationEngine:
                 'total_fuel_cost': (
                     estimated_fuel_cost if infeasible else response_total_cost
                 ),
+                'vehicle_profile': {
+                    'mpg': VEHICLE_MPG,
+                    'tank_capacity_gallons': VEHICLE_TANK,
+                    'max_range_miles': VEHICLE_MAX_RANGE,
+                    'reserve_miles': VEHICLE_RESERVE_MILES,
+                },
                 'average_price_per_gallon': (
                     float(response_total_cost / fuel_purchased_total) if selected_stops
                     else (estimated_fuel_cost / (selected_route.distance_miles / VEHICLE_MPG)

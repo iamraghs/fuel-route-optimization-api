@@ -194,12 +194,12 @@ GOOGLE_API_TIMEOUT_SECONDS = 10
 GOOGLE_ROUTES_API_REQUEST_TIMEOUT = 15
 
 # ============================================================================
-# VEHICLE SPECIFICATIONS
+# VEHICLE SPECIFICATIONS (configurable via environment / .env)
 # ============================================================================
-VEHICLE_FUEL_EFFICIENCY = 10  # Miles per gallon (MPG)
-VEHICLE_FUEL_TANK_CAPACITY = 50  # Gallons (full tank)
-VEHICLE_MAX_RANGE = 500  # Miles (tank capacity × MPG)
-VEHICLE_RESERVE_RANGE_MILES = 50  # Reserve: 50 miles minimum
+VEHICLE_FUEL_EFFICIENCY = config('VEHICLE_FUEL_EFFICIENCY', default=10, cast=int)  # MPG
+VEHICLE_FUEL_TANK_CAPACITY = config('VEHICLE_FUEL_TANK_CAPACITY', default=50, cast=int)  # Gallons
+VEHICLE_MAX_RANGE = config('VEHICLE_MAX_RANGE', default=500, cast=int)  # Miles (tank × MPG)
+VEHICLE_RESERVE_RANGE_MILES = config('VEHICLE_RESERVE_RANGE_MILES', default=50, cast=int)  # Reserve miles
 
 # ============================================================================
 # FUEL STOP OPTIMIZATION PARAMETERS

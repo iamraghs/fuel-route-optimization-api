@@ -33,6 +33,50 @@ class Location:
 class GeocodingService:
     """Geocode addresses to coordinates with caching and request coalescing."""
 
+    # Location types that represent a real, resolvable place.
+    # Country-only results (e.g. garbage input resolving to "United States")
+    # are REJECTED — they cannot be routed to.
+    _VALID_GEOCODE_TYPES = {
+        'locality', 'postal_code', 'administrative_area_level_1',
+        'administrative_area_level_2', 'administrative_area_level_3',
+        'establishment', 'route', 'street_address', 'intersection',
+        'sublocality', 'neighborhood', 'premise', 'park', 'airport',
+        'transit_station', 'point_of_interest',
+    }
+
+    @staticmethod
+    def _is_valid_geocode_result(result: dict) -> bool:
+        """Reject country-only or partial fallback results.
+
+        Google returns status OK with a country-level result (e.g. the
+        geographic center of the US) for garbage input like '566' or
+        'uhjdhuegyd'. Such results have types == ['country', 'political']
+        and cannot be routed to. This gate rejects them.
+        """
+        try:
+            types = set(result.get('types', []))
+            formatted = result.get('formatted_address', '')
+
+            # A real place must have at least one locality-level type
+            if not types & GeocodingService._VALID_GEOCODE_TYPES:
+                return False
+
+            # Country-only or state-only matches are not routable
+            if types <= {'country', 'political', 'administrative_area_level_1'}:
+                return False
+
+            # Never accept a result whose formatted address is just the country
+            country_components = [
+                c for c in result.get('address_components', [])
+                if 'country' in c.get('types', [])
+            ]
+            if country_components and formatted.lower() == country_components[0].get('long_name', '').lower():
+                return False
+
+            return True
+        except Exception:
+            return False
+
     @staticmethod
     def geocode(address: str, request_id: str = '') -> Optional[Location]:
         """Geocode address to coordinates with caching and request coalescing."""
@@ -68,6 +112,16 @@ class GeocodingService:
                     raise ValueError(f"Geocoding failed: {data.get('status')}")
 
                 result = data['results'][0]
+                # CONFIDENCE GATE: reject country-only / partial fallback results
+                if not GeocodingService._is_valid_geocode_result(result):
+                    logger.warning(
+                        f"[{request_id}] Geocoding confidence too low for '{address}': "
+                        f"types={result.get('types')} formatted='{result.get('formatted_address')}'"
+                    )
+                    raise ValueError(
+                        f"Location could not be resolved to a valid place: {address}"
+                    )
+
                 geometry = result['geometry']['location']
                 location = Location(
                     latitude=geometry['lat'],
