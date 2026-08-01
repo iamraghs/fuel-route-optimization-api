@@ -331,12 +331,6 @@ class FuelRouteOptimizationEngine:
                 'average_price_per_gallon': round(avg_price_per_gal, 3),
                 'total_fuel_stops': 0,
                 'starting_fuel_gallons': VEHICLE_TANK,
-                'vehicle_profile': {
-                    'mpg': VEHICLE_MPG,
-                    'tank_capacity_gallons': VEHICLE_TANK,
-                    'max_range_miles': VEHICLE_MAX_RANGE,
-                    'reserve_miles': VEHICLE_RESERVE_MILES,
-                },
                 'fuel_purchased_at_stops': 0.0,
                 'total_fuel_available': round(VEHICLE_TANK, 1),
                 'fuel_remaining_at_destination': round(VEHICLE_TANK - estimated_fuel, 1),
@@ -869,12 +863,6 @@ class FuelRouteOptimizationEngine:
                 'total_fuel_cost': (
                     estimated_fuel_cost if infeasible else response_total_cost
                 ),
-                'vehicle_profile': {
-                    'mpg': VEHICLE_MPG,
-                    'tank_capacity_gallons': VEHICLE_TANK,
-                    'max_range_miles': VEHICLE_MAX_RANGE,
-                    'reserve_miles': VEHICLE_RESERVE_MILES,
-                },
                 'average_price_per_gallon': (
                     float(response_total_cost / fuel_purchased_total) if selected_stops
                     else (estimated_fuel_cost / (selected_route.distance_miles / VEHICLE_MPG)

@@ -126,9 +126,6 @@ class TripSummarySerializer(serializers.Serializer):
     fuel_purchased_at_stops = serializers.SerializerMethodField()
     total_fuel_available = serializers.SerializerMethodField()
     fuel_remaining_at_destination = serializers.SerializerMethodField()
-
-    # ✅ Vehicle profile (configurable via env)
-    vehicle_profile = serializers.DictField(required=False)
     
     def get_total_distance_miles(self, obj):
         """Round to 1 decimal place."""
