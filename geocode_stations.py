@@ -17,7 +17,9 @@ import django
 django.setup()
 from django.contrib.gis.geos import Point
 from django.db import transaction
-from fuel_routing.models import FuelStation
+from django.utils import timezone
+from datetime import timedelta
+from fuel_routing.models import FuelStation, GeocodeFailure
 from fuel_routing.constants import GOOGLE_API_KEY
 import requests
 
@@ -68,9 +70,14 @@ def geocode_station(station):
 def main():
     dry_run = "--dry-run" in sys.argv
     batch_size = None
+    # Accept both `--batch 100` (usage docstring) and `--batch=100` (README).
+    if "--batch" in sys.argv:
+        i = sys.argv.index("--batch")
+        if i + 1 < len(sys.argv):
+            batch_size = int(sys.argv[i + 1])
     for arg in sys.argv:
         if arg.startswith("--batch="):
-            batch_size = int(arg.split("=")[1])
+            batch_size = int(arg.split("=", 1)[1])
 
     stations = FuelStation.objects.filter(is_active=True, latitude=0).order_by("opis_id")
     total = stations.count()
@@ -107,6 +114,24 @@ def main():
             failed += 1
             if failed <= 5:  # Show first 5 failures
                 print(f"  [{i}/{total}] OPIS {station.opis_id}: NOT FOUND — {build_query(station)}")
+            # Record in the GeocodeFailure retry queue (the model's documented
+            # role for preprocessing geocoding failures). Dedupe by unresolved
+            # address so re-runs don't accumulate duplicates.
+            try:
+                query = build_query(station)
+                if not GeocodeFailure.objects.filter(
+                    original_address=query, city=station.city,
+                    state=station.state, is_resolved=False,
+                ).exists():
+                    GeocodeFailure.objects.create(
+                        original_address=query,
+                        city=station.city,
+                        state=station.state,
+                        failure_reason='Geocoding failed during station import',
+                        next_retry_at=timezone.now() + timedelta(hours=1),
+                    )
+            except Exception:
+                pass  # Best-effort; never interrupt the geocoding loop
 
     print(f"\nDone: {succeeded} geocoded, {failed} failed, {skipped} skipped")
     remaining = FuelStation.objects.filter(is_active=True, latitude=0).count()

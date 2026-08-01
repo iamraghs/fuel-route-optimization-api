@@ -10,6 +10,12 @@ from decouple import config
 BASE_DIR = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = BASE_DIR.parent
 
+# The logs/ directory is gitignored, so a fresh clone has no logs/ folder.
+# RotatingFileHandler cannot create its parent directory and would make
+# django.setup() fail ("Unable to configure handler 'file'") on every
+# management command. Create it up front so first-run commands work.
+BASE_DIR.joinpath('logs').mkdir(exist_ok=True)
+
 # Security Settings
 SECRET_KEY = config('SECRET_KEY', default='django-insecure-dev-key-change-in-production')
 DEBUG = config('DEBUG', default=True, cast=bool)
