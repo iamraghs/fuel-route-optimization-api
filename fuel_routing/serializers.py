@@ -238,6 +238,10 @@ class FuelOptimizationRequestSerializer(serializers.Serializer):
     def _validate_location(self, value, field_name):
         """Common validation for start and finish locations."""
         if isinstance(value, str):
+            if len(value.strip()) == 0:
+                raise serializers.ValidationError(
+                    f"{field_name} cannot be empty."
+                )
             if not (1 <= len(value) <= 1024):
                 raise serializers.ValidationError(
                     f"{field_name} must be between 1 and 1024 characters"

@@ -174,6 +174,13 @@ class FuelRouteOptimizationEngine:
                     "Destination could not be resolved to a valid location."
                 )
 
+            # Reject identical origin and destination
+            if (abs(start_loc.latitude - end_loc.latitude) < 1e-6
+                    and abs(start_loc.longitude - end_loc.longitude) < 1e-6):
+                raise ValueError(
+                    "Start and end locations cannot be the same."
+                )
+
             # ── STEP 2: CHECK CACHE KEYED BY RESOLVED COORDINATES ──
             # Cache key uses normalized coordinates, NOT raw input. This ensures
             # failed geocodes can never reuse a previous route's cached result,
