@@ -105,6 +105,11 @@ def optimize_fuel_route(request):
     except Exception as e:
         logger.error(f"Optimization error: {e}")
         return Response(
-            {'error': 'Optimization failed', 'detail': str(e)},
+            {
+                "status": "error",
+                "error_code": "INTERNAL_ERROR",
+                "message": "An internal error occurred while processing the request.",
+                "detail": str(e),
+            },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )

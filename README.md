@@ -789,14 +789,24 @@ Unreachable responses replace completed-route metrics with availability informat
 }
 ```
 
-Serializer errors return HTTP 400 with field-specific validation messages:
+Validation errors return HTTP 400 with a structured error envelope:
 ```json
-{"start": ["Must be address string or {'lat': x, 'lng': y}"]}
+{
+  "status": "error",
+  "error_code": "INVALID_DESTINATION",
+  "message": "Destination could not be resolved to a valid location."
+}
 ```
+Error codes: `INVALID_DESTINATION`, `INVALID_ORIGIN`, `INVALID_REQUEST`.
 
-Server errors return HTTP 500 with an error description:
+Server errors return HTTP 500 with the same envelope:
 ```json
-{"error": "Optimization failed", "detail": "..."}
+{
+  "status": "error",
+  "error_code": "INTERNAL_ERROR",
+  "message": "An internal error occurred while processing the request.",
+  "detail": "..."
+}
 ```
 
 ## Testing
