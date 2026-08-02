@@ -193,7 +193,9 @@ LOGGING = {
 # ============================================================================
 # GOOGLE APIs Configuration
 # ============================================================================
-GOOGLE_MAPS_API_KEY = config('GOOGLE_MAPS_API_KEY', default='AIzaSyBSyzO1BUpxasIHBSz89hz7QeQzRLXUyuA')
+# API key must come from the environment (`.env`), never from committed code.
+# Empty default: the engine raises a clear "API key not configured" error if missing.
+GOOGLE_MAPS_API_KEY = config('GOOGLE_MAPS_API_KEY', default='')
 GOOGLE_ROUTES_API_ENDPOINT = 'https://routes.googleapis.com/directions/v2:computeRoutes'
 GOOGLE_GEOCODING_API_ENDPOINT = 'https://maps.googleapis.com/maps/api/geocode/json'
 GOOGLE_API_TIMEOUT_SECONDS = 10
