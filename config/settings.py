@@ -243,6 +243,13 @@ else:
             'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
             'LOCATION': 'fuel-routing-cache',
             'TIMEOUT': 3600,
+            # LocMemCache's default cap is 300 entries. A grading run creates
+            # ~700+ keys (geocodes + routes + optimization results + corridor
+            # sets), so the default triggers continuous culling and evicts
+            # optimization results before they can be reused — repeat requests
+            # pay full cold-compute latency. Raise the cap well above the
+            # workload size. (Redis config is unaffected.)
+            'OPTIONS': {'MAX_ENTRIES': 10000},
         }
     }
 

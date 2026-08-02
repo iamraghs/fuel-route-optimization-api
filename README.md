@@ -205,6 +205,11 @@ All route alternatives are processed independently through the full optimization
 
 ## Cache Architecture
 
+> **Note on backends:** the default configuration uses Django's in-process
+> `LocMemCache` (set `REDIS_ENABLED=True` + `REDIS_URL` in `.env` to switch to
+> Redis, required for cross-worker sharing with multiple gunicorn workers).
+> All keys/TTLs below apply identically to either backend.
+
 ### Layer Details
 
 | Cache Layer | Storage | Key Format | TTL | Invalidated By |
